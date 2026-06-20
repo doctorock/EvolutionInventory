@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <!--
+      net48 is required: Pastel.Evolution.dll is a .NET Framework library
+      that depends on System.Data.SqlClient (framework-built-in). This
+      assembly doesn't exist in .NET 8, so the SDK won't initialise there.
+    -->
+    <TargetFramework>net48</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <AssemblyName>EvolutionInventory</AssemblyName>
+    <RootNamespace>JekyllAndHide.Evolution</RootNamespace>
+  </PropertyGroup>
+
+  <!--
+    References to the Pastel Evolution SDK DLLs extracted from
+    Pastel.Evolution.11.0.0.10.zip into the evolution\ folder.
+  -->
+  <ItemGroup>
+    <Reference Include="Pastel.Evolution">
+      <HintPath>..\evolution\Pastel.Evolution.11.0.0.10\Pastel.Evolution.dll</HintPath>
+      <Private>True</Private>
+    </Reference>
+    <Reference Include="Pastel.Evolution.Common">
+      <HintPath>..\evolution\Pastel.Evolution.11.0.0.10\Pastel.Evolution.Common.dll</HintPath>
+      <Private>True</Private>
+    </Reference>
+  </ItemGroup>
+
+</Project>
