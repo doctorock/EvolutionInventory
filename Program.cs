@@ -7,15 +7,19 @@
 //    SDK Code         : 1824675
 //
 //  Usage:
-//    dotnet run
-//    dotnet run [outputFilePath]
-//    dotnet run [outputFilePath] --all        (include zero-qty items)
-//    dotnet run [outputFilePath] --debug      (dump DataTable columns)
+//    dotnet run -- --method sql               # direct SQL (default, fastest)
+//    dotnet run -- --method sdk               # Pastel InventoryItem API
+//    dotnet run -- --method sql --all         # include zero-qty items
+//    dotnet run -- --method sdk --debug       # show DataTable schema + null ratio
+//    dotnet run -- --method sdk --limit 10    # resolve only first 10 items (SDK probe)
+//    dotnet run -- --method sdk --limit 0     # resolve all items (slow on remote server)
+//    dotnet run -- --method sql C:\out.txt    # custom output path
 // ============================================================
 
 using System;
 using System.Collections.Generic;
 using System.Data;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Text;
@@ -26,28 +30,21 @@ namespace JekyllAndHide.Evolution
     internal static class Program
     {
         // -------------------------------------------------------
-        //  CONNECTION CONFIG — update before running
+        //  CONNECTION CONFIG
         // -------------------------------------------------------
 
-        private const string SqlServer = "(local)";
-
-        /// <summary>
-        ///   Your Evolution company database name.
-        ///   Check in SQL Server Management Studio or
-        ///   Evolution → Utilities → Company Information.
-        /// </summary>
-        private const string CompanyDb = "EvolutionCompany"; // ← TODO: set your company DB name
-
-        private const string CommonDb   = "EvolutionCommon";
-        private const string DbUser     = "";   // empty = Windows integrated auth
-        private const string DbPassword = "";
+        private const string SqlServer    = "41.76.210.14,1433";
+        private const string CompanyDb    = "MATT Copy of International Colours CT (Pty) Ltd";
+        private const string CommonDb     = "SageCommon";
+        private const string DbUser       = "sa";
+        private const string DbPassword   = @"G4%$nZyk@w!qd";
 
         // -------------------------------------------------------
         //  SDK LICENCE (from evolution\Auth Key.txt)
         // -------------------------------------------------------
 
         private const string SerialNumber = "DE12211012";
-        private const string AuthCode     = "1824675";   // SDK Code
+        private const string AuthCode     = "1824675";
 
         // -------------------------------------------------------
         //  TARGET STORE
@@ -61,136 +58,105 @@ namespace JekyllAndHide.Evolution
 
         private static int Main(string[] args)
         {
+            // ---- parse flags -----------------------------------------------
             bool showAll   = args.Any(a => a.Equals("--all",   StringComparison.OrdinalIgnoreCase));
             bool debugMode = args.Any(a => a.Equals("--debug", StringComparison.OrdinalIgnoreCase));
 
-            string outputPath = args.FirstOrDefault(a => !a.StartsWith("--"))
+            // --method sql | sdk   (default: sql)
+            string method    = "sql";
+            var    argsList  = args.ToList();
+            int    methodIdx = argsList.FindIndex(a => a.Equals("--method", StringComparison.OrdinalIgnoreCase));
+            if (methodIdx >= 0 && methodIdx + 1 < argsList.Count)
+            {
+                method = argsList[methodIdx + 1].Trim().ToLowerInvariant();
+                argsList.RemoveAt(methodIdx + 1);
+                argsList.RemoveAt(methodIdx);
+            }
+            if (method != "sql" && method != "sdk")
+            {
+                Console.Error.WriteLine($"Unknown method '{method}'. Use --method sql or --method sdk.");
+                return 1;
+            }
+
+            // --limit N   (SDK only — cap per-item lookups; 0 = all; default 100)
+            int limit    = 100;
+            int limitIdx = argsList.FindIndex(a => a.Equals("--limit", StringComparison.OrdinalIgnoreCase));
+            if (limitIdx >= 0 && limitIdx + 1 < argsList.Count)
+            {
+                int.TryParse(argsList[limitIdx + 1], out limit);
+                argsList.RemoveAt(limitIdx + 1);
+                argsList.RemoveAt(limitIdx);
+            }
+
+            // first non-flag arg is optional output path
+            string outputPath = argsList.FirstOrDefault(a => !a.StartsWith("--"))
                 ?? Path.Combine(
                     AppContext.BaseDirectory,
-                    $"evolution_store{StoreCode}_{DateTime.Now:yyyyMMdd_HHmmss}.txt");
+                    $"evolution_store{StoreCode}_{method}_{DateTime.Now:yyyyMMdd_HHmmss}.txt");
+
+            // ---- startup banner --------------------------------------------
+            var totalTimer = Stopwatch.StartNew();
 
             Banner();
             Console.WriteLine($"  Store      : {StoreCode}");
+            Console.WriteLine($"  Method     : {method.ToUpperInvariant()}");
             Console.WriteLine($"  SQL Server : {SqlServer}");
             Console.WriteLine($"  Company DB : {CompanyDb}");
             Console.WriteLine($"  Common DB  : {CommonDb}");
             Console.WriteLine($"  Serial     : {SerialNumber}");
             Console.WriteLine($"  Output     : {outputPath}");
             Console.WriteLine($"  Zero-qty   : {(showAll ? "included (--all)" : "excluded")}");
+            if (method == "sdk")
+                Console.WriteLine($"  SDK limit  : {(limit <= 0 ? "all items" : $"{limit} items (--limit N to change)")}");
             Console.WriteLine();
 
             try
             {
-                // ------------------------------------------------
-                //  Step 1 — Initialise SDK (mandatory call order)
+                // ---- SDK init (required by both methods) -------------------
+                //  Mandatory order:
                 //    1. CreateCommonDBConnection
                 //    2. SetLicense
                 //    3. CreateConnection
-                //  All static on DatabaseContext. No writes anywhere.
-                // ------------------------------------------------
 
-                Console.Write("Connecting to EvolutionCommon... ");
+                var sw = Stopwatch.StartNew();
+                Console.Write("Connecting to common DB... ");
                 DatabaseContext.CreateCommonDBConnection(SqlServer, CommonDb, DbUser, DbPassword, false);
-                Console.WriteLine("OK");
+                Console.WriteLine($"OK  ({sw.ElapsedMilliseconds} ms)");
 
+                sw.Restart();
                 Console.Write($"Setting licence ({SerialNumber})... ");
                 DatabaseContext.SetLicense(SerialNumber, AuthCode);
-                Console.WriteLine("OK");
+                Console.WriteLine($"OK  ({sw.ElapsedMilliseconds} ms)");
 
-                Console.Write($"Connecting to company DB ({CompanyDb})... ");
+                sw.Restart();
+                Console.Write($"Connecting to company DB... ");
                 DatabaseContext.CreateConnection(SqlServer, CompanyDb, DbUser, DbPassword, false);
-                Console.WriteLine("OK\n");
+                Console.WriteLine($"OK  ({sw.ElapsedMilliseconds} ms)\n");
 
-                // ------------------------------------------------
-                //  Step 2 — Locate warehouse 005
-                // ------------------------------------------------
-
+                // ---- locate warehouse --------------------------------------
+                sw.Restart();
                 Console.Write($"Looking up warehouse '{StoreCode}'... ");
                 int whId = Warehouse.FindByCode(StoreCode);
-
-                if (whId < 0)
-                    whId = Warehouse.Find(StoreCode); // fallback: search by description
-
+                if (whId < 0) whId = Warehouse.Find(StoreCode);
                 if (whId < 0)
                     throw new Exception(
                         $"Warehouse '{StoreCode}' not found. " +
                         "Verify the code in Evolution → Inventory → Warehouses.");
 
                 var warehouse = new Warehouse(whId);
-                Console.WriteLine($"OK — [{warehouse.Code}] {warehouse.Description}\n");
+                Console.WriteLine($"OK  ({sw.ElapsedMilliseconds} ms)");
+                Console.WriteLine($"  [{warehouse.Code}] {warehouse.Description}  (internal ID: {warehouse.ID})\n");
 
-                // ------------------------------------------------
-                //  Step 3 — Read inventory items (read-only)
-                //
-                //  InventoryItem.List() returns a DataTable of all active items.
-                //  For each item we access its WarehouseContext for store 005
-                //  via the indexer item[warehouse] — no writes, no Post(), no Save().
-                // ------------------------------------------------
+                // ---- fetch inventory ---------------------------------------
+                List<StoreItem> results = method == "sdk"
+                    ? ReadInventorySdk(warehouse, showAll, debugMode, limit)
+                    : ReadInventorySql(warehouse.ID, showAll, debugMode);
 
-                Console.WriteLine("Reading inventory items...");
-                DataTable itemTable = InventoryItem.List("Active = 1");
-
-                if (debugMode)
-                {
-                    Console.WriteLine("[DEBUG] InventoryItem.List columns:");
-                    foreach (DataColumn col in itemTable.Columns)
-                        Console.WriteLine($"  {col.ColumnName} ({col.DataType.Name})");
-                    Console.WriteLine();
-                }
-
-                // Detect the item-code column name (SDK versions differ)
-                string codeCol = itemTable.Columns.Contains("Code")     ? "Code"
-                               : itemTable.Columns.Contains("ItemCode") ? "ItemCode"
-                               : itemTable.Columns[0].ColumnName;
-
-                Console.WriteLine($"  {itemTable.Rows.Count} active items found. Fetching store {StoreCode} quantities...\n");
-
-                var results   = new List<StoreItem>();
-                int processed = 0;
-
-                foreach (DataRow row in itemTable.Rows)
-                {
-                    string code = row[codeCol]?.ToString()?.Trim() ?? string.Empty;
-                    if (string.IsNullOrEmpty(code)) continue;
-
-                    try
-                    {
-                        var item = new InventoryItem(code);
-
-                        // item[warehouseCode] returns a warehouse-scoped InventoryItem view.
-                        // Quantities and cost on this object are specific to store 005.
-                        InventoryItem whItem = item[warehouse.Code];
-                        if (whItem == null) continue;
-
-                        double onHand = whItem.QtyOnHand;
-                        double free   = whItem.QtyFree;
-
-                        if (!showAll && onHand == 0 && free == 0) continue;
-
-                        results.Add(new StoreItem(
-                            item.Code,
-                            item.Description ?? string.Empty,
-                            onHand,
-                            free));
-                    }
-                    catch (EvolutionException)
-                    {
-                        // Item not linked to this warehouse — skip
-                    }
-
-                    processed++;
-                    if (processed % 50 == 0)
-                        Console.Write($"\r  Processed {processed}/{itemTable.Rows.Count}...   ");
-                }
-
-                Console.WriteLine($"\r  Done. {results.Count} item(s) with stock in store {StoreCode}.\n");
+                Console.WriteLine($"  {results.Count} item(s) returned.\n");
                 results.Sort((a, b) => string.Compare(a.Code, b.Code, StringComparison.OrdinalIgnoreCase));
 
-                // ------------------------------------------------
-                //  Step 4 — Write output
-                // ------------------------------------------------
-
-                WriteResults(results, warehouse, outputPath);
+                // ---- write output ------------------------------------------
+                WriteResults(results, warehouse, method, outputPath, totalTimer.Elapsed);
                 return 0;
             }
             catch (EvolutionException ex)
@@ -209,25 +175,211 @@ namespace JekyllAndHide.Evolution
             }
         }
 
-        // -------------------------------------------------------
-        //  Write formatted results to console + text file
-        // -------------------------------------------------------
+        // ================================================================
+        //  METHOD A — Pastel Evolution SDK
+        //
+        //  Phase 1: InventoryItem.List("") → stock master DataTable
+        //           (columns: StockLink, Code, Description_1/2/3,
+        //            ServiceItem, ItemActive — NO quantity columns).
+        //
+        //  Phase 2: For each item, new InventoryItem(stockLink) then
+        //           item[warehouseCode] to get per-warehouse quantities.
+        //           Each call is one DB round-trip; on a remote server
+        //           this is slow. Use --limit N to cap how many items
+        //           are resolved (default 100). Pass --limit 0 for all.
+        //
+        //  Use --debug to dump the stock master DataTable schema.
+        // ================================================================
 
-        private static void WriteResults(List<StoreItem> results, Warehouse warehouse, string outputPath)
+        private static List<StoreItem> ReadInventorySdk(Warehouse warehouse, bool showAll, bool debugMode, int limit)
+        {
+            // ---- Phase 1: stock master (one batch query) ----------------
+            var sw = Stopwatch.StartNew();
+            Console.Write("  [SDK] InventoryItem.List() — stock master... ");
+            DataTable table = InventoryItem.List("");
+            Console.WriteLine($"{table.Rows.Count} rows  ({sw.ElapsedMilliseconds} ms)");
+
+            if (debugMode)
+            {
+                Console.WriteLine("  [SDK] DataTable columns:");
+                foreach (DataColumn col in table.Columns)
+                    Console.WriteLine($"    {col.ColumnName}  ({col.DataType.Name})");
+                Console.WriteLine();
+            }
+
+            int cap = limit <= 0 ? table.Rows.Count : Math.Min(limit, table.Rows.Count);
+            Console.WriteLine($"  [SDK] Resolving warehouse [{warehouse.Code}] quantities" +
+                              $" for {cap} of {table.Rows.Count} items" +
+                              (limit > 0 && limit < table.Rows.Count ? $" (--limit {limit})" : " (all)") +
+                              "...");
+
+            // ---- Phase 2: per-item warehouse quantity lookup ------------
+            sw.Restart();
+            var results      = new List<StoreItem>();
+            int resolved     = 0;
+            int nullCount    = 0;
+            int errorCount   = 0;
+            int processed    = 0;
+            string firstError = string.Empty;
+
+            foreach (DataRow row in table.Rows)
+            {
+                if (processed >= cap) break;
+                processed++;
+
+                string code = row.IsNull("Code") ? string.Empty : row["Code"].ToString()!;
+                if (string.IsNullOrWhiteSpace(code)) continue;
+
+                string desc = row.IsNull("Description_1") ? string.Empty : row["Description_1"].ToString()!;
+                int stockLink = row.IsNull("StockLink") ? -1 : Convert.ToInt32(row["StockLink"]);
+
+                if (processed % 10 == 0)
+                    Console.Write($"\r  [SDK] {processed}/{cap}...  ");
+
+                InventoryItem? whItem = null;
+                try
+                {
+                    var item = stockLink >= 0
+                        ? new InventoryItem(stockLink)
+                        : new InventoryItem(code);
+                    whItem = item[warehouse.Code];
+                }
+                catch (EvolutionException ex)
+                {
+                    errorCount++;
+                    if (firstError.Length == 0) firstError = ex.Message;
+                    if (showAll) results.Add(new StoreItem(code, desc, 0d, 0d));
+                    continue;
+                }
+
+                if (whItem == null)
+                {
+                    nullCount++;
+                    if (showAll) results.Add(new StoreItem(code, desc, 0d, 0d));
+                    continue;
+                }
+
+                resolved++;
+                double onHand = whItem.QtyOnHand;
+                double free   = whItem.QtyFree;
+                if (showAll || onHand != 0d || free != 0d)
+                    results.Add(new StoreItem(code, desc, onHand, free));
+            }
+
+            Console.WriteLine($"\r  [SDK] Done  ({sw.ElapsedMilliseconds} ms)                    ");
+            Console.WriteLine($"  Resolved OK            : {resolved} / {processed}");
+            Console.WriteLine($"  Null (no whse record)  : {nullCount} / {processed}");
+            Console.WriteLine($"  SDK errors             : {errorCount} / {processed}");
+            if (firstError.Length > 0)
+                Console.WriteLine($"  First error            : {firstError}");
+            if (errorCount == processed && processed > 0)
+                Console.WriteLine(
+                    "  !! All items failed. This database copy is missing the detail records\n" +
+                    "     (_etblStockDetails) that the SDK requires to load individual items.\n" +
+                    "     Per-warehouse quantities are unavailable via the SDK on this DB.\n" +
+                    "     Use --method sql for accurate inventory data.");
+            if (processed < table.Rows.Count)
+                Console.WriteLine($"  ({table.Rows.Count - processed} items skipped — use --limit 0 to attempt all)");
+
+            return results;
+        }
+
+        // ================================================================
+        //  METHOD B — Direct SQL against _bvStockAndWhseItems
+        //
+        //  Bypasses the SDK object model entirely. Filters by the
+        //  warehouse's internal integer ID (WhseID), which the app
+        //  resolves via Warehouse.FindByCode() above.
+        //
+        //  Confirmed column names (from _bvStockAndWhseItems):
+        //    WhseID, Code, Description_1, QtyOnHand, QtyAvailable
+        // ================================================================
+
+        private static List<StoreItem> ReadInventorySql(int warehouseId, bool showAll, bool debugMode)
+        {
+            string connStr = $"Data Source={SqlServer};Initial Catalog={CompanyDb};" +
+                             $"User ID={DbUser};Password={DbPassword};Connection Timeout=30;";
+
+            var sw = Stopwatch.StartNew();
+            Console.Write("  [SQL] Opening connection... ");
+            using var conn = new System.Data.SqlClient.SqlConnection(connStr);
+            conn.Open();
+            Console.WriteLine($"OK  ({sw.ElapsedMilliseconds} ms)");
+
+            if (debugMode)
+            {
+                // Dump a sample row so you can inspect actual column names
+                Console.WriteLine("  [SQL] Sampling one row from _bvStockAndWhseItems...");
+                using var schemaCmd = new System.Data.SqlClient.SqlCommand(
+                    $"SELECT TOP 1 * FROM _bvStockAndWhseItems WHERE WhseID = {warehouseId}", conn);
+                using var schemaReader = schemaCmd.ExecuteReader(CommandBehavior.SchemaOnly);
+                var schemaTable = schemaReader.GetSchemaTable();
+                if (schemaTable != null)
+                    foreach (DataRow r in schemaTable.Rows)
+                        Console.WriteLine($"    {r["ColumnName"]}  ({r["DataType"]})");
+                Console.WriteLine();
+            }
+
+            string sql = @"
+                SELECT
+                    v.Code,
+                    v.Description_1,
+                    ISNULL(v.QtyOnHand,    0) AS QtyOnHand,
+                    ISNULL(v.QtyAvailable, 0) AS QtyAvailable
+                FROM _bvStockAndWhseItems v
+                WHERE v.WhseID = @WhseID"
+                + (showAll ? "" : @"
+                AND (ISNULL(v.QtyOnHand, 0) <> 0 OR ISNULL(v.QtyAvailable, 0) <> 0)")
+                + @"
+                ORDER BY v.Code";
+
+            sw.Restart();
+            Console.Write("  [SQL] Executing query... ");
+            using var cmd = new System.Data.SqlClient.SqlCommand(sql, conn);
+            cmd.Parameters.AddWithValue("@WhseID", warehouseId);
+            cmd.CommandTimeout = 120;
+
+            using var reader = cmd.ExecuteReader();
+            var results = new List<StoreItem>();
+            while (reader.Read())
+            {
+                results.Add(new StoreItem(
+                    reader.GetString(0),
+                    reader.IsDBNull(1) ? string.Empty : reader.GetString(1),
+                    Convert.ToDouble(reader["QtyOnHand"]),
+                    Convert.ToDouble(reader["QtyAvailable"])));
+            }
+
+            Console.WriteLine($"Done  ({sw.ElapsedMilliseconds} ms)");
+            return results;
+        }
+
+        // ================================================================
+        //  OUTPUT
+        // ================================================================
+
+        private static void WriteResults(
+            List<StoreItem> results,
+            Warehouse       warehouse,
+            string          method,
+            string          outputPath,
+            TimeSpan        elapsed)
         {
             const int W_CODE = 25;
             const int W_DESC = 50;
             const int W_QTY  = 14;
 
-            // Build header using PadRight/PadLeft (variable-width interpolation doesn't compile)
-            string header  = "ItemCode".PadRight(W_CODE) + " " +
+            string header  = "ItemCode".PadRight(W_CODE)    + " " +
                              "Description".PadRight(W_DESC) + " " +
-                             "QtyOnHand".PadLeft(W_QTY) + " " +
+                             "QtyOnHand".PadLeft(W_QTY)     + " " +
                              "QtyFree".PadLeft(W_QTY);
             string divider = new string('─', header.Length);
-            string stamp   = $"Store {warehouse.Code} ({warehouse.Description})  |  Generated: {DateTime.Now:yyyy-MM-dd HH:mm:ss}";
+            string stamp   = $"Store {warehouse.Code} ({warehouse.Description})" +
+                             $"  |  Method: {method.ToUpperInvariant()}" +
+                             $"  |  Generated: {DateTime.Now:yyyy-MM-dd HH:mm:ss}" +
+                             $"  |  Fetch time: {elapsed.TotalSeconds:F2}s";
 
-            // Console output
+            // Console
             Console.WriteLine(stamp);
             Console.WriteLine(divider);
             Console.WriteLine(header);
@@ -235,9 +387,9 @@ namespace JekyllAndHide.Evolution
             foreach (var item in results)
                 Console.WriteLine(FormatLine(item, W_CODE, W_DESC, W_QTY));
             Console.WriteLine(divider);
-            Console.WriteLine($"Total: {results.Count} item(s)");
+            Console.WriteLine($"Total: {results.Count} item(s)  |  Fetch time: {elapsed.TotalSeconds:F2}s");
 
-            // File output
+            // File
             Directory.CreateDirectory(Path.GetDirectoryName(outputPath) ?? ".");
             using var writer = new StreamWriter(outputPath, append: false, Encoding.UTF8);
             writer.WriteLine(stamp);
@@ -247,15 +399,15 @@ namespace JekyllAndHide.Evolution
             foreach (var item in results)
                 writer.WriteLine(FormatLine(item, W_CODE, W_DESC, W_QTY));
             writer.WriteLine(divider);
-            writer.WriteLine($"Total: {results.Count} item(s)  |  {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+            writer.WriteLine($"Total: {results.Count} item(s)  |  {DateTime.Now:yyyy-MM-dd HH:mm:ss}  |  Fetch time: {elapsed.TotalSeconds:F2}s");
 
             Console.WriteLine($"\nSaved to: {outputPath}");
         }
 
         private static string FormatLine(StoreItem item, int wCode, int wDesc, int wQty)
-            => item.Code.PadRight(wCode) + " " +
-               item.Description.PadRight(wDesc) + " " +
-               item.QtyOnHand.ToString("N2").PadLeft(wQty) + " " +
+            => item.Code.PadRight(wCode)                     + " " +
+               item.Description.PadRight(wDesc)              + " " +
+               item.QtyOnHand.ToString("N2").PadLeft(wQty)   + " " +
                item.QtyFree.ToString("N2").PadLeft(wQty);
 
         private static void Banner()
@@ -268,9 +420,9 @@ namespace JekyllAndHide.Evolution
         }
     }
 
-    // -------------------------------------------------------
-    //  Value type for one item's inventory data
-    // -------------------------------------------------------
+    // ================================================================
+    //  Data transfer object — one item's inventory data
+    // ================================================================
 
     internal class StoreItem
     {
