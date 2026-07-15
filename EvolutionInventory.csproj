@@ -15,16 +15,16 @@
   </PropertyGroup>
 
   <!--
-    References to the Pastel Evolution SDK DLLs extracted from
-    Pastel.Evolution.11.0.0.10.zip into the evolution\ folder.
+    References to the Pastel Evolution SDK DLLs copied from the
+    Evolution 11.2.0.0 App folder into the evolution\ folder.
   -->
   <ItemGroup>
     <Reference Include="Pastel.Evolution">
-      <HintPath>..\evolution\Pastel.Evolution.11.0.0.10\Pastel.Evolution.dll</HintPath>
+      <HintPath>..\evolution\Pastel.Evolution.11.2.0.0\Pastel.Evolution.dll</HintPath>
       <Private>True</Private>
     </Reference>
     <Reference Include="Pastel.Evolution.Common">
-      <HintPath>..\evolution\Pastel.Evolution.11.0.0.10\Pastel.Evolution.Common.dll</HintPath>
+      <HintPath>..\evolution\Pastel.Evolution.11.2.0.0\Pastel.Evolution.Common.dll</HintPath>
       <Private>True</Private>
     </Reference>
   </ItemGroup>

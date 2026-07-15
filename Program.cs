@@ -1,6 +1,7 @@
 // ============================================================
-//  EvolutionInventory — Read inventory for store 005 via the
-//  Pastel Evolution SDK (read-only; no writes are performed).
+//  EvolutionInventory — Read inventory and create sales orders
+//  via the Pastel Evolution SDK (read-only inventory queries;
+//  sales-order writes require appropriate Evolution permissions).
 //
 //  Auth credentials from evolution\Auth Key.txt:
 //    Developer serial : DE12211012
@@ -14,6 +15,10 @@
 //    dotnet run -- --method sdk --limit 10    # resolve only first 10 items (SDK probe)
 //    dotnet run -- --method sdk --limit 0     # resolve all items (slow on remote server)
 //    dotnet run -- --method sql C:\out.txt    # custom output path
+//    dotnet run -- --method order --customer CUST001 --item ITEM001 --qty 5 --price 100.00
+//                                             # place a sales order (saved, not posted)
+//    dotnet run -- --method order --customer CUST001 --item ITEM001 --qty 5 --price 100.00 --process
+//                                             # process order directly into an invoice
 // ============================================================
 
 using System;
@@ -47,7 +52,7 @@ namespace JekyllAndHide.Evolution
         private const string AuthCode     = "1824675";
 
         // -------------------------------------------------------
-        //  TARGET STORE
+        //  TARGET STORE (inventory methods only)
         // -------------------------------------------------------
 
         private const string StoreCode = "005";
@@ -62,7 +67,7 @@ namespace JekyllAndHide.Evolution
             bool showAll   = args.Any(a => a.Equals("--all",   StringComparison.OrdinalIgnoreCase));
             bool debugMode = args.Any(a => a.Equals("--debug", StringComparison.OrdinalIgnoreCase));
 
-            // --method sql | sdk   (default: sql)
+            // --method sql | sdk | order   (default: sql)
             string method    = "sql";
             var    argsList  = args.ToList();
             int    methodIdx = argsList.FindIndex(a => a.Equals("--method", StringComparison.OrdinalIgnoreCase));
@@ -72,9 +77,9 @@ namespace JekyllAndHide.Evolution
                 argsList.RemoveAt(methodIdx + 1);
                 argsList.RemoveAt(methodIdx);
             }
-            if (method != "sql" && method != "sdk")
+            if (method != "sql" && method != "sdk" && method != "order")
             {
-                Console.Error.WriteLine($"Unknown method '{method}'. Use --method sql or --method sdk.");
+                Console.Error.WriteLine($"Unknown method '{method}'. Use --method sql, --method sdk, or --method order.");
                 return 1;
             }
 
@@ -88,6 +93,25 @@ namespace JekyllAndHide.Evolution
                 argsList.RemoveAt(limitIdx);
             }
 
+            // --customer, --item, --warehouse, --qty, --price, --process   (order mode only)
+            string customerCode  = PopArg(argsList, "--customer");
+            string itemCode      = PopArg(argsList, "--item");
+            string orderWarehouse = PopArg(argsList, "--warehouse");
+            if (string.IsNullOrWhiteSpace(orderWarehouse)) orderWarehouse = StoreCode;
+            bool   processNow   = argsList.RemoveAll(a => a.Equals("--process", StringComparison.OrdinalIgnoreCase)) > 0;
+            double orderQty     = 1.0;
+            double orderPrice   = 0.0;
+            { if (double.TryParse(PopArg(argsList, "--qty"),   System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var v)) orderQty   = v; }
+            { if (double.TryParse(PopArg(argsList, "--price"), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var v)) orderPrice = v; }
+
+            if (method == "order")
+            {
+                if (string.IsNullOrWhiteSpace(customerCode))
+                { Console.Error.WriteLine("--customer CODE is required for --method order."); return 1; }
+                if (string.IsNullOrWhiteSpace(itemCode))
+                { Console.Error.WriteLine("--item CODE is required for --method order."); return 1; }
+            }
+
             // first non-flag arg is optional output path
             string outputPath = argsList.FirstOrDefault(a => !a.StartsWith("--"))
                 ?? Path.Combine(
@@ -98,21 +122,33 @@ namespace JekyllAndHide.Evolution
             var totalTimer = Stopwatch.StartNew();
 
             Banner();
-            Console.WriteLine($"  Store      : {StoreCode}");
             Console.WriteLine($"  Method     : {method.ToUpperInvariant()}");
             Console.WriteLine($"  SQL Server : {SqlServer}");
             Console.WriteLine($"  Company DB : {CompanyDb}");
             Console.WriteLine($"  Common DB  : {CommonDb}");
             Console.WriteLine($"  Serial     : {SerialNumber}");
-            Console.WriteLine($"  Output     : {outputPath}");
-            Console.WriteLine($"  Zero-qty   : {(showAll ? "included (--all)" : "excluded")}");
-            if (method == "sdk")
-                Console.WriteLine($"  SDK limit  : {(limit <= 0 ? "all items" : $"{limit} items (--limit N to change)")}");
+            if (method == "order")
+            {
+                Console.WriteLine($"  Customer   : {customerCode}");
+                Console.WriteLine($"  Item       : {itemCode}");
+                Console.WriteLine($"  Warehouse  : {orderWarehouse}");
+                Console.WriteLine($"  Quantity   : {orderQty}");
+                Console.WriteLine($"  Price      : {orderPrice:F2}");
+                Console.WriteLine($"  Action     : {(processNow ? "process → invoice" : "save as order")}");
+            }
+            else
+            {
+                Console.WriteLine($"  Store      : {StoreCode}");
+                Console.WriteLine($"  Output     : {outputPath}");
+                Console.WriteLine($"  Zero-qty   : {(showAll ? "included (--all)" : "excluded")}");
+                if (method == "sdk")
+                    Console.WriteLine($"  SDK limit  : {(limit <= 0 ? "all items" : $"{limit} items (--limit N to change)")}");
+            }
             Console.WriteLine();
 
             try
             {
-                // ---- SDK init (required by both methods) -------------------
+                // ---- SDK init (required by all methods) -------------------
                 //  Mandatory order:
                 //    1. CreateCommonDBConnection
                 //    2. SetLicense
@@ -133,7 +169,16 @@ namespace JekyllAndHide.Evolution
                 DatabaseContext.CreateConnection(SqlServer, CompanyDb, DbUser, DbPassword, false);
                 Console.WriteLine($"OK  ({sw.ElapsedMilliseconds} ms)\n");
 
-                // ---- locate warehouse --------------------------------------
+                // ---- sales order (exits before warehouse lookup) -----------
+                if (method == "order")
+                {
+                    string reference = CreateSalesOrder(customerCode, itemCode, orderWarehouse, orderQty, orderPrice, processNow);
+                    Console.WriteLine($"\nDone.  Reference: {reference}");
+                    Console.WriteLine($"Total time: {totalTimer.Elapsed.TotalSeconds:F2}s");
+                    return 0;
+                }
+
+                // ---- locate warehouse (inventory methods only) -------------
                 sw.Restart();
                 Console.Write($"Looking up warehouse '{StoreCode}'... ");
                 int whId = Warehouse.FindByCode(StoreCode);
@@ -162,8 +207,18 @@ namespace JekyllAndHide.Evolution
             catch (EvolutionException ex)
             {
                 Console.Error.WriteLine($"\n[Evolution error] {ex.Message}");
-                if (ex.InnerException != null)
-                    Console.Error.WriteLine($"  Inner: {ex.InnerException.Message}");
+                Console.Error.WriteLine($"  Source: {ex.Source}");
+                foreach (System.Collections.DictionaryEntry entry in ex.Data)
+                    Console.Error.WriteLine($"  Data[{entry.Key}]: {entry.Value}");
+                Exception? inner = ex.InnerException;
+                int depth = 1;
+                while (inner != null)
+                {
+                    Console.Error.WriteLine($"  Inner[{depth}] ({inner.GetType().Name}): {inner.Message}");
+                    inner = inner.InnerException;
+                    depth++;
+                }
+                Console.Error.WriteLine($"  Stack: {ex.StackTrace}");
                 return 2;
             }
             catch (Exception ex)
@@ -173,6 +228,56 @@ namespace JekyllAndHide.Evolution
                     Console.Error.WriteLine($"  Inner: {ex.InnerException.Message}");
                 return 1;
             }
+        }
+
+        // ================================================================
+        //  CREATE SALES ORDER — Pastel Evolution SalesOrder SDK
+        //
+        //  Builds a single-line SalesOrder against one inventory item.
+        //
+        //  processNow = false  → Save()    order placed, no GL postings,
+        //                        returns the generated order number.
+        //  processNow = true   → Process() converts to invoice immediately,
+        //                        posts to GL/Customer/Inventory ledgers,
+        //                        returns the generated invoice number.
+        // ================================================================
+
+        private static string CreateSalesOrder(
+            string customerCode,
+            string itemCode,
+            string warehouseCode,
+            double quantity,
+            double unitPrice,
+            bool   processNow)
+        {
+            Console.WriteLine($"Building order — customer: {customerCode}  item: {itemCode}  warehouse: {warehouseCode}  qty: {quantity}  price: {unitPrice:F2}");
+
+            var SO = new SalesOrder
+            {
+                Customer    = new Customer(customerCode),
+                InvoiceDate = DateTime.Now
+            };
+
+            Console.Write("  Adding detail line... ");
+            OrderDetail od = SO.Detail.Add(itemCode, quantity, unitPrice);
+            od.TaxType = new TaxRate(1);
+            Console.WriteLine("OK");
+
+            if (processNow)
+            {
+                Console.Write("  Processing into invoice... ");
+                string invoiceNo = SO.Process();
+                Console.WriteLine("OK");
+                Console.WriteLine($"  Invoice No : {invoiceNo}");
+                return invoiceNo;
+            }
+
+            Console.Write("  Saving order... ");
+            SO.Save();
+            string orderNo = SO.OrderNo;
+            Console.WriteLine("OK");
+            Console.WriteLine($"  Order No   : {orderNo}");
+            return orderNo;
         }
 
         // ================================================================
@@ -308,7 +413,6 @@ namespace JekyllAndHide.Evolution
 
             if (debugMode)
             {
-                // Dump a sample row so you can inspect actual column names
                 Console.WriteLine("  [SQL] Sampling one row from _bvStockAndWhseItems...");
                 using var schemaCmd = new System.Data.SqlClient.SqlCommand(
                     $"SELECT TOP 1 * FROM _bvStockAndWhseItems WHERE WhseID = {warehouseId}", conn);
@@ -409,6 +513,20 @@ namespace JekyllAndHide.Evolution
                item.Description.PadRight(wDesc)              + " " +
                item.QtyOnHand.ToString("N2").PadLeft(wQty)   + " " +
                item.QtyFree.ToString("N2").PadLeft(wQty);
+
+        // ================================================================
+        //  HELPERS
+        // ================================================================
+
+        private static string PopArg(List<string> args, string flag)
+        {
+            int i = args.FindIndex(a => a.Equals(flag, StringComparison.OrdinalIgnoreCase));
+            if (i < 0 || i + 1 >= args.Count) return string.Empty;
+            string val = args[i + 1];
+            args.RemoveAt(i + 1);
+            args.RemoveAt(i);
+            return val;
+        }
 
         private static void Banner()
         {
