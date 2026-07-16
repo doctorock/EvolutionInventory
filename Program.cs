@@ -7,18 +7,24 @@
 //    Developer serial : DE12211012
 //    SDK Code         : 1824675
 //
-//  Usage:
-//    dotnet run -- --method sql               # direct SQL (default, fastest)
-//    dotnet run -- --method sdk               # Pastel InventoryItem API
-//    dotnet run -- --method sql --all         # include zero-qty items
-//    dotnet run -- --method sdk --debug       # show DataTable schema + null ratio
-//    dotnet run -- --method sdk --limit 10    # resolve only first 10 items (SDK probe)
-//    dotnet run -- --method sdk --limit 0     # resolve all items (slow on remote server)
-//    dotnet run -- --method sql C:\out.txt    # custom output path
+//  Usage — inventory:
+//    dotnet run -- --method sql                          # all warehouses, stock only (default)
+//    dotnet run -- --method sql --all                    # all warehouses, include zero-qty
+//    dotnet run -- --method sql --warehouse 005          # single warehouse
+//    dotnet run -- --method sql --warehouse 005 --all    # single warehouse, include zero-qty
+//    dotnet run -- --method sql --warehouse 005 C:\out.txt  # custom output path (single only)
+//    dotnet run -- --method sdk --warehouse 005          # SDK path (single warehouse only)
+//    dotnet run -- --method sdk --warehouse 005 --limit 10  # SDK probe, first 10 items
+//    dotnet run -- --method sdk --warehouse 005 --limit 0   # SDK, all items (slow on remote)
+//    dotnet run -- --method sdk --warehouse 005 --debug  # show DataTable schema
+//
+//  Usage — sales orders:
 //    dotnet run -- --method order --customer CUST001 --item ITEM001 --qty 5 --price 100.00
-//                                             # place a sales order (saved, not posted)
+//                                             # save as order (no GL posting)
 //    dotnet run -- --method order --customer CUST001 --item ITEM001 --qty 5 --price 100.00 --process
-//                                             # process order directly into an invoice
+//                                             # process directly into an invoice
+//    dotnet run -- --method order ... --warehouse 001
+//                                             # order from a specific warehouse (default: 005)
 // ============================================================
 
 using System;
@@ -52,10 +58,10 @@ namespace JekyllAndHide.Evolution
         private const string AuthCode     = "1824675";
 
         // -------------------------------------------------------
-        //  TARGET STORE (inventory methods only)
+        //  FALLBACK WAREHOUSE (order mode only; inventory defaults to "all")
         // -------------------------------------------------------
 
-        private const string StoreCode = "005";
+        private const string DefaultOrderWarehouse = "005";
 
         // -------------------------------------------------------
         //  ENTRY POINT
@@ -93,14 +99,17 @@ namespace JekyllAndHide.Evolution
                 argsList.RemoveAt(limitIdx);
             }
 
-            // --customer, --item, --warehouse, --qty, --price, --process   (order mode only)
-            string customerCode  = PopArg(argsList, "--customer");
-            string itemCode      = PopArg(argsList, "--item");
-            string orderWarehouse = PopArg(argsList, "--warehouse");
-            if (string.IsNullOrWhiteSpace(orderWarehouse)) orderWarehouse = StoreCode;
-            bool   processNow   = argsList.RemoveAll(a => a.Equals("--process", StringComparison.OrdinalIgnoreCase)) > 0;
-            double orderQty     = 1.0;
-            double orderPrice   = 0.0;
+            // --warehouse: inventory mode → warehouse code or "all" (default)
+            //             order mode   → warehouse to order from (default DefaultOrderWarehouse)
+            string warehouseArg   = PopArg(argsList, "--warehouse");
+            string customerCode   = PopArg(argsList, "--customer");
+            string itemCode       = PopArg(argsList, "--item");
+            string orderWarehouse = string.IsNullOrWhiteSpace(warehouseArg) ? DefaultOrderWarehouse : warehouseArg;
+            string invWarehouse   = string.IsNullOrWhiteSpace(warehouseArg) ? "all" : warehouseArg;
+            bool   allWarehouses  = invWarehouse.Equals("all", StringComparison.OrdinalIgnoreCase);
+            bool   processNow     = argsList.RemoveAll(a => a.Equals("--process", StringComparison.OrdinalIgnoreCase)) > 0;
+            double orderQty       = 1.0;
+            double orderPrice     = 0.0;
             { if (double.TryParse(PopArg(argsList, "--qty"),   System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var v)) orderQty   = v; }
             { if (double.TryParse(PopArg(argsList, "--price"), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var v)) orderPrice = v; }
 
@@ -112,11 +121,13 @@ namespace JekyllAndHide.Evolution
                 { Console.Error.WriteLine("--item CODE is required for --method order."); return 1; }
             }
 
-            // first non-flag arg is optional output path
-            string outputPath = argsList.FirstOrDefault(a => !a.StartsWith("--"))
-                ?? Path.Combine(
-                    AppContext.BaseDirectory,
-                    $"evolution_store{StoreCode}_{method}_{DateTime.Now:yyyyMMdd_HHmmss}.txt");
+            // Output path: single-warehouse only; "all" mode generates one file per warehouse.
+            string customPath = argsList.FirstOrDefault(a => !a.StartsWith("--")) ?? string.Empty;
+            string dateStamp  = DateTime.Now.ToString("yyyyMMdd_HHmmss");
+            string outputPath = allWarehouses ? string.Empty
+                : (customPath.Length > 0 ? customPath
+                   : Path.Combine(AppContext.BaseDirectory,
+                       $"evolution_{invWarehouse}_{method}_{dateStamp}.txt"));
 
             // ---- startup banner --------------------------------------------
             var totalTimer = Stopwatch.StartNew();
@@ -138,8 +149,8 @@ namespace JekyllAndHide.Evolution
             }
             else
             {
-                Console.WriteLine($"  Store      : {StoreCode}");
-                Console.WriteLine($"  Output     : {outputPath}");
+                Console.WriteLine($"  Warehouse  : {(allWarehouses ? "all" : invWarehouse)}");
+                if (!allWarehouses) Console.WriteLine($"  Output     : {outputPath}");
                 Console.WriteLine($"  Zero-qty   : {(showAll ? "included (--all)" : "excluded")}");
                 if (method == "sdk")
                     Console.WriteLine($"  SDK limit  : {(limit <= 0 ? "all items" : $"{limit} items (--limit N to change)")}");
@@ -178,30 +189,71 @@ namespace JekyllAndHide.Evolution
                     return 0;
                 }
 
-                // ---- locate warehouse (inventory methods only) -------------
-                sw.Restart();
-                Console.Write($"Looking up warehouse '{StoreCode}'... ");
-                int whId = Warehouse.FindByCode(StoreCode);
-                if (whId < 0) whId = Warehouse.Find(StoreCode);
-                if (whId < 0)
-                    throw new Exception(
-                        $"Warehouse '{StoreCode}' not found. " +
-                        "Verify the code in Evolution → Inventory → Warehouses.");
+                // ---- locate warehouse(s) for inventory methods ------------
+                List<Warehouse> warehouses;
+                if (allWarehouses)
+                {
+                    sw.Restart();
+                    Console.Write("Loading warehouses... ");
+                    warehouses = LoadAllWarehouses();
+                    Console.WriteLine($"{warehouses.Count} active  ({sw.ElapsedMilliseconds} ms)\n");
+                }
+                else
+                {
+                    sw.Restart();
+                    Console.Write($"Looking up warehouse '{invWarehouse}'... ");
+                    int whId = Warehouse.FindByCode(invWarehouse);
+                    if (whId < 0) whId = Warehouse.Find(invWarehouse);
+                    if (whId < 0)
+                        throw new Exception(
+                            $"Warehouse '{invWarehouse}' not found. " +
+                            "Verify the code in Evolution → Inventory → Warehouses.");
+                    var wh = new Warehouse(whId);
+                    Console.WriteLine($"OK  ({sw.ElapsedMilliseconds} ms)");
+                    Console.WriteLine($"  [{wh.Code}] {wh.Description}  (internal ID: {wh.ID})\n");
+                    warehouses = [wh];
+                }
 
-                var warehouse = new Warehouse(whId);
-                Console.WriteLine($"OK  ({sw.ElapsedMilliseconds} ms)");
-                Console.WriteLine($"  [{warehouse.Code}] {warehouse.Description}  (internal ID: {warehouse.ID})\n");
+                // ---- fetch and write per warehouse ------------------------
+                var summary = new List<(string Code, string Desc, int Count)>();
 
-                // ---- fetch inventory ---------------------------------------
-                List<StoreItem> results = method == "sdk"
-                    ? ReadInventorySdk(warehouse, showAll, debugMode, limit)
-                    : ReadInventorySql(warehouse.ID, showAll, debugMode);
+                foreach (var warehouse in warehouses)
+                {
+                    if (allWarehouses)
+                    {
+                        Console.WriteLine($"  [{warehouse.Code}] {warehouse.Description}");
+                        Console.WriteLine($"  {new string('─', 60)}");
+                    }
 
-                Console.WriteLine($"  {results.Count} item(s) returned.\n");
-                results.Sort((a, b) => string.Compare(a.Code, b.Code, StringComparison.OrdinalIgnoreCase));
+                    List<StoreItem> results = method == "sdk"
+                        ? ReadInventorySdk(warehouse, showAll, debugMode, limit)
+                        : ReadInventorySql(warehouse.ID, showAll, debugMode);
 
-                // ---- write output ------------------------------------------
-                WriteResults(results, warehouse, method, outputPath, totalTimer.Elapsed);
+                    Console.WriteLine($"  {results.Count} item(s) returned.\n");
+                    results.Sort((a, b) => string.Compare(a.Code, b.Code, StringComparison.OrdinalIgnoreCase));
+
+                    string filePath = allWarehouses
+                        ? Path.Combine(AppContext.BaseDirectory,
+                            $"evolution_{warehouse.Code}_{method}_{dateStamp}.txt")
+                        : outputPath;
+
+                    WriteResults(results, warehouse, method, filePath, totalTimer.Elapsed);
+                    summary.Add((warehouse.Code, warehouse.Description, results.Count));
+                }
+
+                // ---- summary table for multi-warehouse runs ---------------
+                if (allWarehouses)
+                {
+                    int totalItems = summary.Sum(s => s.Count);
+                    Console.WriteLine($"\n{"Code",-6}  {"Warehouse",-42}  {"Items",6}");
+                    Console.WriteLine(new string('─', 58));
+                    foreach (var (code, desc, count) in summary)
+                        Console.WriteLine($"{code,-6}  {desc,-42}  {count,6}");
+                    Console.WriteLine(new string('─', 58));
+                    Console.WriteLine($"{"Total",-6}  {warehouses.Count + " warehouse(s)",-42}  {totalItems,6}");
+                    Console.WriteLine($"\nFiles written to: {AppContext.BaseDirectory}");
+                }
+
                 return 0;
             }
             catch (EvolutionException ex)
@@ -335,19 +387,23 @@ namespace JekyllAndHide.Evolution
                 string code = row.IsNull("Code") ? string.Empty : row["Code"].ToString()!;
                 if (string.IsNullOrWhiteSpace(code)) continue;
 
+                // Service items have no warehouse stock records — skip them.
+                bool isService = !row.IsNull("ServiceItem") && (bool)row["ServiceItem"];
+                if (isService) continue;
+
                 string desc = row.IsNull("Description_1") ? string.Empty : row["Description_1"].ToString()!;
                 int stockLink = row.IsNull("StockLink") ? -1 : Convert.ToInt32(row["StockLink"]);
 
                 if (processed % 10 == 0)
                     Console.Write($"\r  [SDK] {processed}/{cap}...  ");
 
-                InventoryItem? whItem = null;
+                WarehouseContext? wc = null;
                 try
                 {
                     var item = stockLink >= 0
                         ? new InventoryItem(stockLink)
                         : new InventoryItem(code);
-                    whItem = item[warehouse.Code];
+                    wc = item.WarehouseContexts[warehouse.Code];
                 }
                 catch (EvolutionException ex)
                 {
@@ -357,7 +413,7 @@ namespace JekyllAndHide.Evolution
                     continue;
                 }
 
-                if (whItem == null)
+                if (wc == null)
                 {
                     nullCount++;
                     if (showAll) results.Add(new StoreItem(code, desc, 0d, 0d));
@@ -365,8 +421,8 @@ namespace JekyllAndHide.Evolution
                 }
 
                 resolved++;
-                double onHand = whItem.QtyOnHand;
-                double free   = whItem.QtyFree;
+                double onHand = wc.QtyOnHand;
+                double free   = wc.QtyFree;
                 if (showAll || onHand != 0d || free != 0d)
                     results.Add(new StoreItem(code, desc, onHand, free));
             }
@@ -517,6 +573,20 @@ namespace JekyllAndHide.Evolution
         // ================================================================
         //  HELPERS
         // ================================================================
+
+        private static List<Warehouse> LoadAllWarehouses()
+        {
+            DataTable dt = Warehouse.List("");
+            var result = new List<Warehouse>();
+            foreach (DataRow row in dt.Rows)
+            {
+                int id = Convert.ToInt32(row["WhseLink"]);
+                var wh = new Warehouse(id);
+                if (wh.Active) result.Add(wh);
+            }
+            result.Sort((a, b) => string.Compare(a.Code, b.Code, StringComparison.Ordinal));
+            return result;
+        }
 
         private static string PopArg(List<string> args, string flag)
         {
