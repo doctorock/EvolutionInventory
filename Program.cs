@@ -25,6 +25,8 @@
 //                                             # process directly into an invoice
 //    dotnet run -- --method order ... --warehouse 001
 //                                             # order from a specific warehouse (default: 005)
+//    dotnet run -- --method order ... --rep REP001
+//                                             # assign a sales representative to the order
 // ============================================================
 
 using System;
@@ -104,6 +106,7 @@ namespace JekyllAndHide.Evolution
             string warehouseArg   = PopArg(argsList, "--warehouse");
             string customerCode   = PopArg(argsList, "--customer");
             string itemCode       = PopArg(argsList, "--item");
+            string repCode        = PopArg(argsList, "--rep");
             string orderWarehouse = string.IsNullOrWhiteSpace(warehouseArg) ? DefaultOrderWarehouse : warehouseArg;
             string invWarehouse   = string.IsNullOrWhiteSpace(warehouseArg) ? "all" : warehouseArg;
             bool   allWarehouses  = invWarehouse.Equals("all", StringComparison.OrdinalIgnoreCase);
@@ -146,6 +149,8 @@ namespace JekyllAndHide.Evolution
                 Console.WriteLine($"  Quantity   : {orderQty}");
                 Console.WriteLine($"  Price      : {orderPrice:F2}");
                 Console.WriteLine($"  Action     : {(processNow ? "process → invoice" : "save as order")}");
+                if (!string.IsNullOrWhiteSpace(repCode))
+                    Console.WriteLine($"  Sales Rep  : {repCode}");
             }
             else
             {
@@ -183,7 +188,7 @@ namespace JekyllAndHide.Evolution
                 // ---- sales order (exits before warehouse lookup) -----------
                 if (method == "order")
                 {
-                    string reference = CreateSalesOrder(customerCode, itemCode, orderWarehouse, orderQty, orderPrice, processNow);
+                    string reference = CreateSalesOrder(customerCode, itemCode, orderWarehouse, orderQty, orderPrice, processNow, repCode);
                     Console.WriteLine($"\nDone.  Reference: {reference}");
                     Console.WriteLine($"Total time: {totalTimer.Elapsed.TotalSeconds:F2}s");
                     return 0;
@@ -300,7 +305,8 @@ namespace JekyllAndHide.Evolution
             string warehouseCode,
             double quantity,
             double unitPrice,
-            bool   processNow)
+            bool   processNow,
+            string repCode = "")
         {
             Console.WriteLine($"Building order — customer: {customerCode}  item: {itemCode}  warehouse: {warehouseCode}  qty: {quantity}  price: {unitPrice:F2}");
 
@@ -309,6 +315,13 @@ namespace JekyllAndHide.Evolution
                 Customer    = new Customer(customerCode),
                 InvoiceDate = DateTime.Now
             };
+
+            if (!string.IsNullOrWhiteSpace(repCode))
+            {
+                Console.Write($"  Setting sales rep '{repCode}'... ");
+                SO.Representative = new SalesRepresentative(repCode);
+                Console.WriteLine("OK");
+            }
 
             Console.Write("  Adding detail line... ");
             OrderDetail od = SO.Detail.Add(itemCode, quantity, unitPrice);
