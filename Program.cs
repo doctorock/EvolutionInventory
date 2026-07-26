@@ -27,11 +27,25 @@
 //                                             # order from a specific warehouse (default: 005)
 //    dotnet run -- --method order ... --rep REP001
 //                                             # assign a sales representative to the order
+//
+//  Usage — JH inventory snapshot:
+//    dotnet run -- --method snapshot --env nonprod       # read copy Evolution DB → write to interna1_non_production
+//    dotnet run -- --method snapshot --env prod          # read live Evolution DB → write to interna1_b2b
+//                                             # writes JHInventory_Snapshot + promotes to JHInventory_Snapshot_Golden
+//                                             # also saves a text file to the app directory
 // ============================================================
+
+// Code notes 26 July 2026
+
+
+
+//
+
 
 using System;
 using System.Collections.Generic;
 using System.Data;
+using System.Data.SqlClient;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
@@ -65,6 +79,30 @@ namespace JekyllAndHide.Evolution
 
         private const string DefaultOrderWarehouse = "005";
 
+        // Live Evolution company DB — used by snapshot --env prod
+        // (copy DB is used for --env nonprod via the existing CompanyDb constant)
+        private const string CompanyDbLive = "International Colours CT (Pty) Ltd";
+
+        // JH store codes that map to Evolution warehouses for the inventory snapshot
+        private static readonly string[] JhStoreCodes = { "001", "004", "005", "006", "007", "008", "009" };
+
+        // -------------------------------------------------------
+        //  JH WEB DATABASE CONNECTION STRINGS
+        //  NOTE: verify prod string before first live run
+        // -------------------------------------------------------
+
+        private const string JhConnNonProd =
+            "Data Source=148.251.89.211,1433;Network Library=DBMSSOCN;" +
+            "Initial Catalog=interna1_non_production;User ID=interna1_non_production;" +
+            "Password=x6F@21vh;Connection Timeout=15;" +
+            "Connection Lifetime=0;Min Pool Size=0;Max Pool Size=100;Pooling=true;";
+
+        private const string JhConnProd =
+            "Data Source=148.251.89.211,1433;Network Library=DBMSSOCN;" +
+            "Initial Catalog=interna1_b2b;User ID=interna1_user_dev;" +
+            "Password=Sqlserver1433!;Connection Timeout=15;" +
+            "Connection Lifetime=0;Min Pool Size=0;Max Pool Size=100;Pooling=true;";
+
         // -------------------------------------------------------
         //  ENTRY POINT
         // -------------------------------------------------------
@@ -85,9 +123,9 @@ namespace JekyllAndHide.Evolution
                 argsList.RemoveAt(methodIdx + 1);
                 argsList.RemoveAt(methodIdx);
             }
-            if (method != "sql" && method != "sdk" && method != "order")
+            if (method != "sql" && method != "sdk" && method != "order" && method != "snapshot")
             {
-                Console.Error.WriteLine($"Unknown method '{method}'. Use --method sql, --method sdk, or --method order.");
+                Console.Error.WriteLine($"Unknown method '{method}'. Use --method sql, --method sdk, --method order, or --method snapshot.");
                 return 1;
             }
 
@@ -107,6 +145,7 @@ namespace JekyllAndHide.Evolution
             string customerCode   = PopArg(argsList, "--customer");
             string itemCode       = PopArg(argsList, "--item");
             string repCode        = PopArg(argsList, "--rep");
+            string envArg         = PopArg(argsList, "--env");
             string orderWarehouse = string.IsNullOrWhiteSpace(warehouseArg) ? DefaultOrderWarehouse : warehouseArg;
             string invWarehouse   = string.IsNullOrWhiteSpace(warehouseArg) ? "all" : warehouseArg;
             bool   allWarehouses  = invWarehouse.Equals("all", StringComparison.OrdinalIgnoreCase);
@@ -122,6 +161,17 @@ namespace JekyllAndHide.Evolution
                 { Console.Error.WriteLine("--customer CODE is required for --method order."); return 1; }
                 if (string.IsNullOrWhiteSpace(itemCode))
                 { Console.Error.WriteLine("--item CODE is required for --method order."); return 1; }
+            }
+
+            if (method == "snapshot")
+            {
+                if (string.IsNullOrWhiteSpace(envArg) ||
+                    (!envArg.Equals("nonprod", StringComparison.OrdinalIgnoreCase) &&
+                     !envArg.Equals("prod",    StringComparison.OrdinalIgnoreCase)))
+                {
+                    Console.Error.WriteLine("--env nonprod|prod is required for --method snapshot.");
+                    return 1;
+                }
             }
 
             // Output path: single-warehouse only; "all" mode generates one file per warehouse.
@@ -152,6 +202,11 @@ namespace JekyllAndHide.Evolution
                 if (!string.IsNullOrWhiteSpace(repCode))
                     Console.WriteLine($"  Sales Rep  : {repCode}");
             }
+            else if (method == "snapshot")
+            {
+                Console.WriteLine($"  Env        : {envArg}");
+                Console.WriteLine($"  Target DB  : {(envArg.Equals("prod", StringComparison.OrdinalIgnoreCase) ? "interna1_b2b (PROD)" : "interna1_b2b (nonprod)")}");
+            }
             else
             {
                 Console.WriteLine($"  Warehouse  : {(allWarehouses ? "all" : invWarehouse)}");
@@ -164,6 +219,14 @@ namespace JekyllAndHide.Evolution
 
             try
             {
+                // ---- snapshot (no SDK needed — direct JH web DB write) ---
+                if (method == "snapshot")
+                {
+                    UpdateJHInventorySnapshot(envArg);
+                    Console.WriteLine($"\nDone.  Total time: {totalTimer.Elapsed.TotalSeconds:F2}s");
+                    return 0;
+                }
+
                 // ---- SDK init (required by all methods) -------------------
                 //  Mandatory order:
                 //    1. CreateCommonDBConnection
@@ -346,6 +409,397 @@ namespace JekyllAndHide.Evolution
         }
 
         // ================================================================
+        //  UPDATE JH INVENTORY SNAPSHOT
+        //
+        //  Reads current stock levels from the Evolution SQL view
+        //  (_bvStockAndWhseItems) for the 7 JH store codes and writes
+        //  a full snapshot into the JH web database.
+        //
+        //  env = "nonprod"  → copy Evolution DB  +  interna1_non_production
+        //  env = "prod"     → live Evolution DB  +  interna1_b2b
+        // ================================================================
+
+        private static void UpdateJHInventorySnapshot(string env)
+        {
+            bool isProd  = env.Equals("prod", StringComparison.OrdinalIgnoreCase);
+            string jhConn = isProd ? JhConnProd    : JhConnNonProd;
+            string evoDb  = isProd ? CompanyDbLive : CompanyDb;
+
+            Console.WriteLine($"[Snapshot] Environment  : {env.ToUpperInvariant()}");
+            Console.WriteLine($"[Snapshot] Evolution DB : {evoDb}");
+            Console.WriteLine($"[Snapshot] Target DB    : {(isProd ? "interna1_b2b (PROD)" : "interna1_non_production (nonprod)")}");
+            Console.WriteLine();
+
+            var totalSw = Stopwatch.StartNew();
+
+            // ---- Phase 1: Load SKU list from JH web DB -------------------------
+            Console.Write("[Snapshot] Phase 1 — Loading SKUs from JH web DB... ");
+            var sw = Stopwatch.StartNew();
+            HashSet<string> skuSet = SnapshotLoadSkuList(jhConn);
+            Console.WriteLine($"{skuSet.Count} distinct SKUs  ({sw.ElapsedMilliseconds} ms)");
+
+            // ---- Phase 2: Load inventory per store from Evolution SQL ----------
+            Console.WriteLine("[Snapshot] Phase 2 — Loading inventory from Evolution...");
+            sw.Restart();
+            Dictionary<string, int>           whIdMap = SnapshotLookupWarehouseIds(evoDb);
+            Dictionary<string, SnapshotEntry> skuMap  = SnapshotBuildSkuMap(evoDb, whIdMap, skuSet);
+            Console.WriteLine($"[Snapshot]   {skuMap.Count} unique SKUs with inventory  ({sw.ElapsedMilliseconds} ms total)");
+
+            // ---- Phase 3: Write text file --------------------------------------
+            Console.Write("[Snapshot] Phase 3 — Writing text file... ");
+            sw.Restart();
+            string dateStamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
+            string filePath  = Path.Combine(AppContext.BaseDirectory,
+                                            $"jh_inventory_snapshot_{env}_{dateStamp}.txt");
+            SnapshotWriteTextFile(skuMap, filePath);
+            Console.WriteLine($"OK  ({sw.ElapsedMilliseconds} ms)");
+            Console.WriteLine($"[Snapshot]   File: {filePath}");
+
+            // ---- Phase 4: Write to JH web DB ----------------------------------
+            Console.WriteLine("[Snapshot] Phase 4 — Writing to JH web DB...");
+            sw.Restart();
+            SnapshotWriteToDatabase(skuMap, jhConn);
+            Console.WriteLine($"[Snapshot]   Done  ({sw.ElapsedMilliseconds} ms)");
+
+            Console.WriteLine($"\n[Snapshot] Total time: {totalSw.Elapsed.TotalSeconds:F2}s");
+        }
+
+        // ----------------------------------------------------------------
+        //  Phase 1 — load all distinct PastelSKUs from the JH web DB
+        // ----------------------------------------------------------------
+
+        private static HashSet<string> SnapshotLoadSkuList(string jhConn)
+        {
+            const string sql =
+                "SELECT DISTINCT PastelSKU FROM CurrentOrderSheet_porterandcraftcombined " +
+                "WHERE PastelSKU IS NOT NULL AND LEN(PastelSKU) > 0";
+
+            var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            using var conn = new SqlConnection(jhConn);
+            conn.Open();
+            using var cmd = new SqlCommand(sql, conn) { CommandTimeout = 30 };
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read())
+            {
+                string sku = reader.GetString(0).Trim();
+                if (!string.IsNullOrEmpty(sku)) result.Add(sku);
+            }
+            return result;
+        }
+
+        // ----------------------------------------------------------------
+        //  Phase 2a — map JH store codes to Evolution WhseIDs
+        //  Evolution's WhseMst stores the 3-char code in cWhseCode.
+        // ----------------------------------------------------------------
+
+        private static Dictionary<string, int> SnapshotLookupWarehouseIds(string evoDb)
+        {
+            string inList  = string.Join(",", JhStoreCodes.Select(c => $"'{c}'"));
+            string sql     = $"SELECT WhseLink, Code FROM WhseMst WHERE Code IN ({inList})";
+            string connStr = $"Data Source={SqlServer};Initial Catalog={evoDb};" +
+                             $"User ID={DbUser};Password={DbPassword};Connection Timeout=30;";
+
+            var result = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            using var conn = new SqlConnection(connStr);
+            conn.Open();
+            using var cmd    = new SqlCommand(sql, conn) { CommandTimeout = 30 };
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read())
+            {
+                int    id   = reader.GetInt32(0);
+                string code = reader.GetString(1).Trim();
+                result[code] = id;
+                Console.WriteLine($"[Snapshot]   Warehouse {code} → WhseID {id}");
+            }
+
+            foreach (string s in JhStoreCodes)
+                if (!result.ContainsKey(s))
+                    Console.WriteLine($"[Snapshot]   WARNING: store {s} not found in Evolution");
+
+            return result;
+        }
+
+        // ----------------------------------------------------------------
+        //  Phase 2b — for each store, query _bvStockAndWhseItems and
+        //             keep only SKUs that are in the JH SKU list
+        // ----------------------------------------------------------------
+
+        private static Dictionary<string, SnapshotEntry> SnapshotBuildSkuMap(
+            string evoDb, Dictionary<string, int> whIdMap, HashSet<string> skuSet)
+        {
+            const string sql =
+                "SELECT Code, Description_1, ISNULL(QtyAvailable, 0) AS QtyAvailable " +
+                "FROM _bvStockAndWhseItems WHERE WhseID = @WhseID";
+
+            string connStr = $"Data Source={SqlServer};Initial Catalog={evoDb};" +
+                             $"User ID={DbUser};Password={DbPassword};Connection Timeout=30;";
+
+            var skuMap = new Dictionary<string, SnapshotEntry>(StringComparer.OrdinalIgnoreCase);
+
+            using var conn = new SqlConnection(connStr);
+            conn.Open();
+
+            foreach (string storeCode in JhStoreCodes)
+            {
+                if (!whIdMap.TryGetValue(storeCode, out int whseId)) continue;
+
+                var sw       = Stopwatch.StartNew();
+                int total    = 0;
+                int matched  = 0;
+
+                using var cmd    = new SqlCommand(sql, conn) { CommandTimeout = 120 };
+                cmd.Parameters.AddWithValue("@WhseID", whseId);
+                using var reader = cmd.ExecuteReader();
+
+                while (reader.Read())
+                {
+                    total++;
+                    string code = reader.IsDBNull(0) ? string.Empty : reader.GetString(0).Trim();
+                    if (string.IsNullOrEmpty(code) || !skuSet.Contains(code)) continue;
+                    matched++;
+
+                    string desc = reader.IsDBNull(1) ? string.Empty : reader.GetString(1).Trim();
+                    int    qty  = Convert.ToInt32(reader.GetValue(2));
+
+                    if (!skuMap.TryGetValue(code, out var entry))
+                        skuMap[code] = entry = new SnapshotEntry(desc);
+
+                    entry.StoreQty[storeCode] = qty;
+                }
+
+                Console.WriteLine($"[Snapshot]   Store {storeCode} (WhseID {whseId}): " +
+                                  $"{total} Evolution rows, {matched} matched  ({sw.ElapsedMilliseconds} ms)");
+            }
+
+            return skuMap;
+        }
+
+        // ----------------------------------------------------------------
+        //  Phase 3 — write the human-readable text file
+        // ----------------------------------------------------------------
+
+        private static void SnapshotWriteTextFile(
+            Dictionary<string, SnapshotEntry> skuMap, string filePath)
+        {
+            const int W_CODE = 25;
+            const int W_DESC = 50;
+            const int W_QTY  = 8;
+
+            var header = new StringBuilder("ItemCode".PadRight(W_CODE) + " " + "Description".PadRight(W_DESC));
+            foreach (string s in JhStoreCodes) header.Append(" " + ("Qty" + s).PadLeft(W_QTY));
+            header.Append(" " + "Total".PadLeft(W_QTY));
+            string divider = new string('─', header.Length);
+
+            Directory.CreateDirectory(Path.GetDirectoryName(filePath) ?? ".");
+            using var writer = new StreamWriter(filePath, false, Encoding.UTF8);
+            writer.WriteLine($"JH Inventory Snapshot  |  Generated: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+            writer.WriteLine(divider);
+            writer.WriteLine(header);
+            writer.WriteLine(divider);
+
+            int rowCount = 0;
+            foreach (var kvp in skuMap.OrderBy(k => k.Key, StringComparer.OrdinalIgnoreCase))
+            {
+                var line = new StringBuilder(kvp.Key.PadRight(W_CODE) + " " +
+                                             kvp.Value.Description.PadRight(W_DESC));
+                int total = 0;
+                foreach (string s in JhStoreCodes)
+                {
+                    int qty = kvp.Value.StoreQty.TryGetValue(s, out int q) ? q : 0;
+                    line.Append(" " + qty.ToString().PadLeft(W_QTY));
+                    total += qty;
+                }
+                line.Append(" " + total.ToString().PadLeft(W_QTY));
+                writer.WriteLine(line);
+                rowCount++;
+            }
+
+            writer.WriteLine(divider);
+            writer.WriteLine($"Total: {rowCount} SKUs  |  {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+            Console.WriteLine($"[Snapshot]   {rowCount} rows written to text file.");
+        }
+
+        // ----------------------------------------------------------------
+        //  Phase 4 — write to JHInventory_Snapshot + promote to Golden
+        // ----------------------------------------------------------------
+
+        private static void SnapshotWriteToDatabase(
+            Dictionary<string, SnapshotEntry> skuMap, string jhConn)
+        {
+            using var conn = new SqlConnection(jhConn);
+            conn.Open();
+
+            SnapshotEnsureSchema(conn, "JHInventory_Snapshot",        "PK_JHInventory_Snapshot",        "CK_JHSnap");
+            SnapshotEnsureSchema(conn, "JHInventory_Snapshot_Golden", "PK_JHInventory_Snapshot_Golden", "CK_JHSnapGold");
+
+            DataTable dt = SnapshotBuildDataTable(skuMap);
+
+            using (var tran = conn.BeginTransaction())
+            {
+                try
+                {
+                    using (var cmd = new SqlCommand("TRUNCATE TABLE JHInventory_Snapshot", conn, tran))
+                        cmd.ExecuteNonQuery();
+
+                    using (var bulk = new SqlBulkCopy(conn, SqlBulkCopyOptions.Default, tran))
+                    {
+                        bulk.DestinationTableName = "JHInventory_Snapshot";
+                        SnapshotAddColumnMappings(bulk);
+                        bulk.WriteToServer(dt);
+                    }
+                    tran.Commit();
+                }
+                catch { tran.Rollback(); throw; }
+            }
+
+            Console.WriteLine($"[Snapshot]   {dt.Rows.Count} rows written to JHInventory_Snapshot.");
+            SnapshotPromoteToGolden(conn, dt);
+        }
+
+        private static void SnapshotEnsureSchema(
+            SqlConnection conn, string table, string pkName, string ckPrefix)
+        {
+            string createSql = $@"
+IF NOT EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = '{table}')
+CREATE TABLE [{table}] (
+    ItemCode    NVARCHAR(50)  NOT NULL CONSTRAINT [{pkName}] PRIMARY KEY,
+    Description NVARCHAR(200) NOT NULL,
+    Qty001      INT NOT NULL DEFAULT 0 CONSTRAINT [{ckPrefix}_Qty001] CHECK (Qty001 >= 0),
+    Qty004      INT NOT NULL DEFAULT 0 CONSTRAINT [{ckPrefix}_Qty004] CHECK (Qty004 >= 0),
+    Qty005      INT NOT NULL DEFAULT 0 CONSTRAINT [{ckPrefix}_Qty005] CHECK (Qty005 >= 0),
+    Qty006      INT NOT NULL DEFAULT 0 CONSTRAINT [{ckPrefix}_Qty006] CHECK (Qty006 >= 0),
+    Qty007      INT NOT NULL DEFAULT 0 CONSTRAINT [{ckPrefix}_Qty007] CHECK (Qty007 >= 0),
+    Qty008      INT NOT NULL DEFAULT 0 CONSTRAINT [{ckPrefix}_Qty008] CHECK (Qty008 >= 0),
+    Qty009      INT NOT NULL DEFAULT 0 CONSTRAINT [{ckPrefix}_Qty009] CHECK (Qty009 >= 0),
+    QtyTotal    AS (Qty001+Qty004+Qty005+Qty006+Qty007+Qty008+Qty009) PERSISTED,
+    LastUpdated DATETIME NOT NULL DEFAULT GETDATE()
+)";
+            // Migrations for tables created before Qty009 was added
+            string addQty009Sql = $@"
+IF NOT EXISTS (
+    SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+    WHERE TABLE_NAME = '{table}' AND COLUMN_NAME = 'Qty009'
+)
+    ALTER TABLE [{table}] ADD Qty009 INT NOT NULL DEFAULT 0;";
+
+            string upgradeComputedSql = $@"
+IF EXISTS (
+    SELECT 1 FROM sys.computed_columns cc
+    JOIN sys.objects o ON cc.object_id = o.object_id
+    WHERE o.name = '{table}' AND cc.name = 'QtyTotal'
+) AND NOT EXISTS (
+    SELECT 1 FROM sys.computed_columns cc
+    JOIN sys.objects o ON cc.object_id = o.object_id
+    WHERE o.name = '{table}' AND cc.name = 'QtyTotal' AND cc.definition LIKE '%Qty009%'
+)
+BEGIN
+    ALTER TABLE [{table}] DROP COLUMN QtyTotal;
+    ALTER TABLE [{table}] ADD  QtyTotal AS (Qty001+Qty004+Qty005+Qty006+Qty007+Qty008+Qty009) PERSISTED;
+END";
+
+            using (var cmd = new SqlCommand(createSql,        conn)) cmd.ExecuteNonQuery();
+            using (var cmd = new SqlCommand(addQty009Sql,     conn)) cmd.ExecuteNonQuery();
+            using (var cmd = new SqlCommand(upgradeComputedSql, conn)) cmd.ExecuteNonQuery();
+        }
+
+        private static DataTable SnapshotBuildDataTable(Dictionary<string, SnapshotEntry> skuMap)
+        {
+            var dt = new DataTable();
+            dt.Columns.Add("ItemCode",    typeof(string));
+            dt.Columns.Add("Description", typeof(string));
+            dt.Columns.Add("Qty001",      typeof(int));
+            dt.Columns.Add("Qty004",      typeof(int));
+            dt.Columns.Add("Qty005",      typeof(int));
+            dt.Columns.Add("Qty006",      typeof(int));
+            dt.Columns.Add("Qty007",      typeof(int));
+            dt.Columns.Add("Qty008",      typeof(int));
+            dt.Columns.Add("Qty009",      typeof(int));
+            dt.Columns.Add("LastUpdated", typeof(DateTime));
+
+            DateTime now = DateTime.Now;
+            foreach (var kvp in skuMap)
+            {
+                var sq = kvp.Value.StoreQty;
+                dt.Rows.Add(
+                    kvp.Key,
+                    kvp.Value.Description,
+                    sq.TryGetValue("001", out int q1) ? q1 : 0,
+                    sq.TryGetValue("004", out int q4) ? q4 : 0,
+                    sq.TryGetValue("005", out int q5) ? q5 : 0,
+                    sq.TryGetValue("006", out int q6) ? q6 : 0,
+                    sq.TryGetValue("007", out int q7) ? q7 : 0,
+                    sq.TryGetValue("008", out int q8) ? q8 : 0,
+                    sq.TryGetValue("009", out int q9) ? q9 : 0,
+                    now);
+            }
+            return dt;
+        }
+
+        private static void SnapshotAddColumnMappings(SqlBulkCopy bulk)
+        {
+            foreach (string col in new[] { "ItemCode", "Description", "Qty001", "Qty004",
+                                           "Qty005", "Qty006", "Qty007", "Qty008", "Qty009",
+                                           "LastUpdated" })
+                bulk.ColumnMappings.Add(col, col);
+        }
+
+        private static void SnapshotPromoteToGolden(SqlConnection conn, DataTable dt)
+        {
+            const string totalsSql = @"
+                SELECT
+                    (SELECT ISNULL(CAST(SUM(QtyTotal) AS BIGINT), 0) FROM JHInventory_Snapshot)        AS NewTotal,
+                    (SELECT ISNULL(CAST(SUM(QtyTotal) AS BIGINT), 0) FROM JHInventory_Snapshot_Golden) AS GoldenTotal";
+
+            long newTotal, goldenTotal;
+            using (var cmd = new SqlCommand(totalsSql, conn))
+            using (var rdr = cmd.ExecuteReader())
+            {
+                rdr.Read();
+                newTotal    = rdr.GetInt64(0);
+                goldenTotal = rdr.GetInt64(1);
+            }
+
+            if (goldenTotal > 0)
+            {
+                double dropPct = (goldenTotal - newTotal) / (double)goldenTotal * 100.0;
+                if (dropPct > 10.0)
+                {
+                    Console.WriteLine($"[Snapshot]   Golden NOT updated — new total ({newTotal:N0}) is " +
+                                      $"{dropPct:F1}% below Golden ({goldenTotal:N0}), exceeds 10% threshold.");
+                    return;
+                }
+                long change = newTotal - goldenTotal;
+                Console.WriteLine($"[Snapshot]   Promoting to Golden " +
+                                  $"(new: {newTotal:N0}, prev: {goldenTotal:N0}, " +
+                                  $"change: {(change >= 0 ? "+" : "")}{change:N0}).");
+            }
+            else
+            {
+                Console.WriteLine("[Snapshot]   Golden table empty — seeding from snapshot.");
+            }
+
+            using (var tran = conn.BeginTransaction())
+            {
+                try
+                {
+                    using (var cmd = new SqlCommand("TRUNCATE TABLE JHInventory_Snapshot_Golden", conn, tran))
+                        cmd.ExecuteNonQuery();
+
+                    using (var bulk = new SqlBulkCopy(conn, SqlBulkCopyOptions.Default, tran))
+                    {
+                        bulk.DestinationTableName = "JHInventory_Snapshot_Golden";
+                        SnapshotAddColumnMappings(bulk);
+                        bulk.WriteToServer(dt);
+                    }
+                    tran.Commit();
+                }
+                catch { tran.Rollback(); throw; }
+            }
+
+            Console.WriteLine($"[Snapshot]   {dt.Rows.Count} rows written to JHInventory_Snapshot_Golden.");
+        }
+
+        // ================================================================
         //  METHOD A — Pastel Evolution SDK
         //
         //  Phase 1: InventoryItem.List("") → stock master DataTable
@@ -435,9 +889,9 @@ namespace JekyllAndHide.Evolution
 
                 resolved++;
                 double onHand = wc.QtyOnHand;
-                double free   = wc.QtyFree;
-                if (showAll || onHand != 0d || free != 0d)
-                    results.Add(new StoreItem(code, desc, onHand, free));
+                double available = wc.QtyFree;
+                if (showAll || onHand != 0d || available != 0d)
+                    results.Add(new StoreItem(code, desc, onHand, available));
             }
 
             Console.WriteLine($"\r  [SDK] Done  ({sw.ElapsedMilliseconds} ms)                    ");
@@ -545,7 +999,7 @@ namespace JekyllAndHide.Evolution
             string header  = "ItemCode".PadRight(W_CODE)    + " " +
                              "Description".PadRight(W_DESC) + " " +
                              "QtyOnHand".PadLeft(W_QTY)     + " " +
-                             "QtyFree".PadLeft(W_QTY);
+                             "QtyAvailable".PadLeft(W_QTY);
             string divider = new string('─', header.Length);
             string stamp   = $"Store {warehouse.Code} ({warehouse.Description})" +
                              $"  |  Method: {method.ToUpperInvariant()}" +
@@ -581,7 +1035,7 @@ namespace JekyllAndHide.Evolution
             => item.Code.PadRight(wCode)                     + " " +
                item.Description.PadRight(wDesc)              + " " +
                item.QtyOnHand.ToString("N2").PadLeft(wQty)   + " " +
-               item.QtyFree.ToString("N2").PadLeft(wQty);
+               item.QtyAvailable.ToString("N2").PadLeft(wQty);
 
         // ================================================================
         //  HELPERS
@@ -625,19 +1079,31 @@ namespace JekyllAndHide.Evolution
     //  Data transfer object — one item's inventory data
     // ================================================================
 
+    internal class SnapshotEntry
+    {
+        public string Description { get; }
+        public Dictionary<string, int> StoreQty { get; }
+
+        public SnapshotEntry(string description)
+        {
+            Description = description;
+            StoreQty    = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        }
+    }
+
     internal class StoreItem
     {
         public string Code        { get; }
         public string Description { get; }
         public double QtyOnHand   { get; }
-        public double QtyFree     { get; }
+        public double QtyAvailable { get; }
 
-        public StoreItem(string code, string description, double qtyOnHand, double qtyFree)
+        public StoreItem(string code, string description, double qtyOnHand, double qtyAvailable)
         {
-            Code        = code;
-            Description = description;
-            QtyOnHand   = qtyOnHand;
-            QtyFree     = qtyFree;
+            Code          = code;
+            Description   = description;
+            QtyOnHand     = qtyOnHand;
+            QtyAvailable  = qtyAvailable;
         }
     }
 }
