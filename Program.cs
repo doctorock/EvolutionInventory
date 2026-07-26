@@ -37,9 +37,33 @@
 
 // Code notes 26 July 2026
 
+// We have created a new method called snapshot.
+// Refactor required: even the nonprod version of the snapshot method should use the live Evolution database.
+
+// Call it with dotnet run -- --method snapshot --env nonprod
+
+// snapshot aims to replace the current implementation of UpdateInventoryFromPastelCMDNewApproach entirely
+// snapshot uses QtyAvailable which is: QtyOnHand minus quantities reserved on open sales orders
+// the business logic in the order form for which stores to use per brand remains untouched, snapshot just populates JHInventory_Snapshot and JHInventory_Snapshot_Golden
+
+// If you need to rollback to the existing Pastel version first run this else you'll hit the 10% guard between JHInventory_Snapshot and JHInventory_Snapshot_Golden:
+//--truncate table JHInventory_Snapshot_Golden
+
+//Useful SQL queries:
+//select * from "JHInventory_Snapshot"
+//select * from "JHInventory_Snapshot_Golden"
+//--truncate table JHInventory_Snapshot_Golden
 
 
-//
+// I have not yet implemented the SDK call in snapshot because it is too slow but if I am forced to then I will need to chunk in some way probably
+
+// This is how snapshot works:
+//Phase 1 — Connects to the JH web DB and loads all distinct PastelSKU values from CurrentOrderSheet_porterandcraftcombined.
+//Phase 2 — Connects to Evolution SQL, looks up the WhseID for each of the 7 store codes (001 004 005 006 007 008 009) from WhseMst, then runs one _bvStockAndWhseItems query per store and filters results to only SKUs in the Phase 1 list.
+//Phase 3 — Writes a formatted text file to the app directory with per-store columns and a total column, sorted by SKU.
+//Phase 4 — Ensures JHInventory_Snapshot and JHInventory_Snapshot_Golden exist in the JH web DB (creates them if not, migrates if Qty009 column is missing), truncates + bulk-inserts the snapshot, then promotes to Golden unless the new total quantity is more than 10% below the existing Golden (safety guard against a bad run).
+
+// End of code notes 26 July 2026
 
 
 using System;
