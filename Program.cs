@@ -19,7 +19,7 @@
 //    dotnet run -- --method sdk --warehouse 005 --debug  # show DataTable schema
 //
 //  Usage — sales orders:
-//    dotnet run -- --method order --customer CUST001 --item ITEM001 --qty 5 --price 100.00
+//    dotnet run -- --method order --customer ARA001 --item 0211CRBL --qty 5 --price 100.00
 //                                             # save as order (no GL posting)
 //    dotnet run -- --method order --customer CUST001 --item ITEM001 --qty 5 --price 100.00 --process
 //                                             # process directly into an invoice
