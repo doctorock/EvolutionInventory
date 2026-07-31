@@ -22,15 +22,16 @@
 //    dotnet run -- --method order --customer ARA001 --item 0211CRBL --qty 5 --price 100.00
 //                                             # save as order (no GL posting)
 //    dotnet run -- --method order --customer CUST001 --item ITEM001 --qty 5 --price 100.00 --process
-//                                             # process directly into an invoice
+//                                             # process directly into an invoice DON'T USE!
 //    dotnet run -- --method order ... --warehouse 001
 //                                             # order from a specific warehouse (default: 005)
 //    dotnet run -- --method order ... --rep REP001
 //                                             # assign a sales representative to the order
 //
 //  Usage — JH inventory snapshot:
-//    dotnet run -- --method snapshot --env nonprod       # read copy Evolution DB → write to interna1_non_production
-//    dotnet run -- --method snapshot --env prod          # read live Evolution DB → write to interna1_b2b
+//    dotnet run -- --method updatesnapshottables --hostkingenv nonprodhostking --evolutionenv evocopy   # copy Evo DB → interna1_non_production
+//    dotnet run -- --method updatesnapshottables --hostkingenv nonprodhostking --evolutionenv evolive   # live Evo DB → interna1_non_production
+//    dotnet run -- --method updatesnapshottables --hostkingenv prod           --evolutionenv evolive   # live Evo DB → interna1_b2b
 //                                             # writes JHInventory_Snapshot + promotes to JHInventory_Snapshot_Golden
 //                                             # also saves a text file to the app directory
 // ============================================================
@@ -40,7 +41,7 @@
 // We have created a new method called snapshot.
 // Refactor required: even the nonprod version of the snapshot method should use the live Evolution database.
 
-// Call it with dotnet run -- --method snapshot --env nonprod
+// Call it with dotnet run -- --method updatesnapshottables --hostkingenv nonprodhostking --evolutionenv evocopy
 
 // snapshot aims to replace the current implementation of UpdateInventoryFromPastelCMDNewApproach entirely
 // snapshot uses QtyAvailable which is: QtyOnHand minus quantities reserved on open sales orders
@@ -104,7 +105,7 @@ namespace JekyllAndHide.Evolution
         private const string DefaultOrderWarehouse = "005";
 
         // Live Evolution company DB — used by snapshot --env prod
-        // (copy DB is used for --env nonprod via the existing CompanyDb constant)
+        // (copy DB is used for --hostkingenv nonprodhostking via the existing CompanyDb constant)
         private const string CompanyDbLive = "International Colours CT (Pty) Ltd";
 
         // JH store codes that map to Evolution warehouses for the inventory snapshot
@@ -147,9 +148,9 @@ namespace JekyllAndHide.Evolution
                 argsList.RemoveAt(methodIdx + 1);
                 argsList.RemoveAt(methodIdx);
             }
-            if (method != "sql" && method != "sdk" && method != "order" && method != "snapshot")
+            if (method != "sql" && method != "sdk" && method != "order" && method != "updatesnapshottables")
             {
-                Console.Error.WriteLine($"Unknown method '{method}'. Use --method sql, --method sdk, --method order, or --method snapshot.");
+                Console.Error.WriteLine($"Unknown method '{method}'. Use --method sql, --method sdk, --method order, or --method updatesnapshottables.");
                 return 1;
             }
 
@@ -169,7 +170,8 @@ namespace JekyllAndHide.Evolution
             string customerCode   = PopArg(argsList, "--customer");
             string itemCode       = PopArg(argsList, "--item");
             string repCode        = PopArg(argsList, "--rep");
-            string envArg         = PopArg(argsList, "--env");
+            string envArg         = PopArg(argsList, "--hostkingenv");
+            string evolutionEnvArg = PopArg(argsList, "--evolutionenv");
             string orderWarehouse = string.IsNullOrWhiteSpace(warehouseArg) ? DefaultOrderWarehouse : warehouseArg;
             string invWarehouse   = string.IsNullOrWhiteSpace(warehouseArg) ? "all" : warehouseArg;
             bool   allWarehouses  = invWarehouse.Equals("all", StringComparison.OrdinalIgnoreCase);
@@ -187,13 +189,20 @@ namespace JekyllAndHide.Evolution
                 { Console.Error.WriteLine("--item CODE is required for --method order."); return 1; }
             }
 
-            if (method == "snapshot")
+            if (method == "updatesnapshottables")
             {
                 if (string.IsNullOrWhiteSpace(envArg) ||
-                    (!envArg.Equals("nonprod", StringComparison.OrdinalIgnoreCase) &&
-                     !envArg.Equals("prod",    StringComparison.OrdinalIgnoreCase)))
+                    (!envArg.Equals("nonprodhostking", StringComparison.OrdinalIgnoreCase) &&
+                     !envArg.Equals("prod",            StringComparison.OrdinalIgnoreCase)))
                 {
-                    Console.Error.WriteLine("--env nonprod|prod is required for --method snapshot.");
+                    Console.Error.WriteLine("--hostkingenv nonprodhostking|prod is required for --method updatesnapshottables.");
+                    return 1;
+                }
+                if (string.IsNullOrWhiteSpace(evolutionEnvArg) ||
+                    (!evolutionEnvArg.Equals("evocopy", StringComparison.OrdinalIgnoreCase) &&
+                     !evolutionEnvArg.Equals("evolive", StringComparison.OrdinalIgnoreCase)))
+                {
+                    Console.Error.WriteLine("--evolutionenv evocopy|evolive is required for --method updatesnapshottables.");
                     return 1;
                 }
             }
@@ -226,10 +235,11 @@ namespace JekyllAndHide.Evolution
                 if (!string.IsNullOrWhiteSpace(repCode))
                     Console.WriteLine($"  Sales Rep  : {repCode}");
             }
-            else if (method == "snapshot")
+            else if (method == "updatesnapshottables")
             {
                 Console.WriteLine($"  Env        : {envArg}");
-                Console.WriteLine($"  Target DB  : {(envArg.Equals("prod", StringComparison.OrdinalIgnoreCase) ? "interna1_b2b (PROD)" : "interna1_b2b (nonprod)")}");
+                Console.WriteLine($"  Target DB  : {(envArg.Equals("prod", StringComparison.OrdinalIgnoreCase) ? "interna1_b2b (PROD)" : "interna1_non_production (nonprodhostking)")}");
+                Console.WriteLine($"  Evo DB     : {(evolutionEnvArg.Equals("evolive", StringComparison.OrdinalIgnoreCase) ? CompanyDbLive + " (evolive)" : CompanyDb + " (evocopy)")}");
             }
             else
             {
@@ -243,10 +253,10 @@ namespace JekyllAndHide.Evolution
 
             try
             {
-                // ---- snapshot (no SDK needed — direct JH web DB write) ---
-                if (method == "snapshot")
+                // ---- updatesnapshottables (no SDK needed — direct JH web DB write) ---
+                if (method == "updatesnapshottables")
                 {
-                    UpdateJHInventorySnapshot(envArg);
+                    UpdateJHInventorySnapshot(envArg, evolutionEnvArg);
                     Console.WriteLine($"\nDone.  Total time: {totalTimer.Elapsed.TotalSeconds:F2}s");
                     return 0;
                 }
@@ -439,19 +449,20 @@ namespace JekyllAndHide.Evolution
         //  (_bvStockAndWhseItems) for the 7 JH store codes and writes
         //  a full snapshot into the JH web database.
         //
-        //  env = "nonprod"  → copy Evolution DB  +  interna1_non_production
+        //  env = "nonprodhostking"  → copy Evolution DB  +  interna1_non_production
         //  env = "prod"     → live Evolution DB  +  interna1_b2b
         // ================================================================
 
-        private static void UpdateJHInventorySnapshot(string env)
+        private static void UpdateJHInventorySnapshot(string env, string evolutionEnv)
         {
-            bool isProd  = env.Equals("prod", StringComparison.OrdinalIgnoreCase);
-            string jhConn = isProd ? JhConnProd    : JhConnNonProd;
-            string evoDb  = isProd ? CompanyDbLive : CompanyDb;
+            bool isProd   = env.Equals("prod", StringComparison.OrdinalIgnoreCase);
+            bool evoLive  = evolutionEnv.Equals("evolive", StringComparison.OrdinalIgnoreCase);
+            string jhConn = isProd   ? JhConnProd    : JhConnNonProd;
+            string evoDb  = evoLive  ? CompanyDbLive : CompanyDb;
 
             Console.WriteLine($"[Snapshot] Environment  : {env.ToUpperInvariant()}");
             Console.WriteLine($"[Snapshot] Evolution DB : {evoDb}");
-            Console.WriteLine($"[Snapshot] Target DB    : {(isProd ? "interna1_b2b (PROD)" : "interna1_non_production (nonprod)")}");
+            Console.WriteLine($"[Snapshot] Target DB    : {(isProd ? "interna1_b2b (PROD)" : "interna1_non_production (nonprodhostking)")}");
             Console.WriteLine();
 
             var totalSw = Stopwatch.StartNew();
