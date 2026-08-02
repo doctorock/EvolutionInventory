@@ -19,8 +19,13 @@
 //    dotnet run -- --method sdk --warehouse 005 --debug  # show DataTable schema
 //
 //  Usage — sales orders:
-//    dotnet run -- --method order --customer ARA001 --item 0211CRBL --qty 5 --price 100.00
+//    dotnet run -- --method order --customer ARA001 --item 0211CRBL --qty 5 --price 100.00 --rep 002 --warehouse 004
 //                                             # save as order (no GL posting)
+// dotnet run -- --method order --customer ARA001 --warehouse 004 --rep 002 --item 0211CRBL --qty 5 --price 100.00 --item 0212CRBL --qty 3 --price 85.00 --item 0251CBLK --qty 2 --price 150.00 --item 0271CBLK --qty 1 --price 200.00 --item 1003BROBRN --qty 4 --price 95.00
+//                                             # save as multi SKU order (no GL posting)
+
+
+
 //    dotnet run -- --method order --customer CUST001 --item ITEM001 --qty 5 --price 100.00 --process
 //                                             # process directly into an invoice DON'T USE!
 //    dotnet run -- --method order ... --warehouse 001
@@ -168,7 +173,9 @@ namespace JekyllAndHide.Evolution
             //             order mode   → warehouse to order from (default DefaultOrderWarehouse)
             string warehouseArg   = PopArg(argsList, "--warehouse");
             string customerCode   = PopArg(argsList, "--customer");
-            string itemCode       = PopArg(argsList, "--item");
+            List<string> itemCodes  = PopAllArgs(argsList, "--item");
+            List<string> qtyStrs    = PopAllArgs(argsList, "--qty");
+            List<string> priceStrs  = PopAllArgs(argsList, "--price");
             string repCode        = PopArg(argsList, "--rep");
             string envArg         = PopArg(argsList, "--hostkingenv");
             string evolutionEnvArg = PopArg(argsList, "--evolutionenv");
@@ -176,17 +183,23 @@ namespace JekyllAndHide.Evolution
             string invWarehouse   = string.IsNullOrWhiteSpace(warehouseArg) ? "all" : warehouseArg;
             bool   allWarehouses  = invWarehouse.Equals("all", StringComparison.OrdinalIgnoreCase);
             bool   processNow     = argsList.RemoveAll(a => a.Equals("--process", StringComparison.OrdinalIgnoreCase)) > 0;
-            double orderQty       = 1.0;
-            double orderPrice     = 0.0;
-            { if (double.TryParse(PopArg(argsList, "--qty"),   System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var v)) orderQty   = v; }
-            { if (double.TryParse(PopArg(argsList, "--price"), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var v)) orderPrice = v; }
+
+            var orderLines = new List<(string ItemCode, double Qty, double Price)>();
+            for (int li = 0; li < itemCodes.Count; li++)
+            {
+                double qty   = 1.0;
+                double price = 0.0;
+                if (li < qtyStrs.Count)   double.TryParse(qtyStrs[li],   System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out qty);
+                if (li < priceStrs.Count) double.TryParse(priceStrs[li], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out price);
+                orderLines.Add((itemCodes[li], qty, price));
+            }
 
             if (method == "order")
             {
                 if (string.IsNullOrWhiteSpace(customerCode))
                 { Console.Error.WriteLine("--customer CODE is required for --method order."); return 1; }
-                if (string.IsNullOrWhiteSpace(itemCode))
-                { Console.Error.WriteLine("--item CODE is required for --method order."); return 1; }
+                if (orderLines.Count == 0)
+                { Console.Error.WriteLine("At least one --item CODE is required for --method order."); return 1; }
             }
 
             if (method == "updatesnapshottables")
@@ -227,10 +240,10 @@ namespace JekyllAndHide.Evolution
             if (method == "order")
             {
                 Console.WriteLine($"  Customer   : {customerCode}");
-                Console.WriteLine($"  Item       : {itemCode}");
                 Console.WriteLine($"  Warehouse  : {orderWarehouse}");
-                Console.WriteLine($"  Quantity   : {orderQty}");
-                Console.WriteLine($"  Price      : {orderPrice:F2}");
+                Console.WriteLine($"  Lines      : {orderLines.Count}");
+                for (int li = 0; li < orderLines.Count; li++)
+                    Console.WriteLine($"    [{li+1}] {orderLines[li].ItemCode,-20} qty={orderLines[li].Qty}  price={orderLines[li].Price:F2}");
                 Console.WriteLine($"  Action     : {(processNow ? "process → invoice" : "save as order")}");
                 if (!string.IsNullOrWhiteSpace(repCode))
                     Console.WriteLine($"  Sales Rep  : {repCode}");
@@ -285,7 +298,7 @@ namespace JekyllAndHide.Evolution
                 // ---- sales order (exits before warehouse lookup) -----------
                 if (method == "order")
                 {
-                    string reference = CreateSalesOrder(customerCode, itemCode, orderWarehouse, orderQty, orderPrice, processNow, repCode);
+                    string reference = CreateSalesOrder(customerCode, orderLines, orderWarehouse, processNow, repCode);
                     Console.WriteLine($"\nDone.  Reference: {reference}");
                     Console.WriteLine($"Total time: {totalTimer.Elapsed.TotalSeconds:F2}s");
                     return 0;
@@ -398,14 +411,12 @@ namespace JekyllAndHide.Evolution
 
         private static string CreateSalesOrder(
             string customerCode,
-            string itemCode,
+            List<(string ItemCode, double Qty, double Price)> lines,
             string warehouseCode,
-            double quantity,
-            double unitPrice,
             bool   processNow,
             string repCode = "")
         {
-            Console.WriteLine($"Building order — customer: {customerCode}  item: {itemCode}  warehouse: {warehouseCode}  qty: {quantity}  price: {unitPrice:F2}");
+            Console.WriteLine($"Building order — customer: {customerCode}  warehouse: {warehouseCode}  lines: {lines.Count}");
 
             var SO = new SalesOrder
             {
@@ -420,10 +431,13 @@ namespace JekyllAndHide.Evolution
                 Console.WriteLine("OK");
             }
 
-            Console.Write("  Adding detail line... ");
-            OrderDetail od = SO.Detail.Add(itemCode, quantity, unitPrice);
-            od.TaxType = new TaxRate(1);
-            Console.WriteLine("OK");
+            foreach (var line in lines)
+            {
+                Console.Write($"  Adding line {line.ItemCode} qty={line.Qty} price={line.Price:F2}... ");
+                OrderDetail od = SO.Detail.Add(line.ItemCode, line.Qty, line.Price);
+                od.TaxType = new TaxRate(1);
+                Console.WriteLine("OK");
+            }
 
             if (processNow)
             {
@@ -1098,6 +1112,20 @@ END";
             args.RemoveAt(i + 1);
             args.RemoveAt(i);
             return val;
+        }
+
+        private static List<string> PopAllArgs(List<string> args, string flag)
+        {
+            var results = new List<string>();
+            int i;
+            while ((i = args.FindIndex(a => a.Equals(flag, StringComparison.OrdinalIgnoreCase))) >= 0
+                   && i + 1 < args.Count)
+            {
+                results.Add(args[i + 1]);
+                args.RemoveAt(i + 1);
+                args.RemoveAt(i);
+            }
+            return results;
         }
 
         private static void Banner()
