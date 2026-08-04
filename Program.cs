@@ -18,11 +18,13 @@
 //    dotnet run -- --method sdk --warehouse 005 --limit 0   # SDK, all items (slow on remote)
 //    dotnet run -- --method sdk --warehouse 005 --debug  # show DataTable schema
 //
-//  Usage — sales orders:
-//    dotnet run -- --method order --customer ARA001 --item 0211CRBL --qty 5 --price 100.00 --rep 002 --warehouse 004
-//                                             # save as order (no GL posting)
-// dotnet run -- --method order --customer ARA001 --warehouse 004 --rep 002 --item 0211CRBL --qty 5 --price 100.00 --item 0212CRBL --qty 3 --price 85.00 --item 0251CBLK --qty 2 --price 150.00 --item 0271CBLK --qty 1 --price 200.00 --item 1003BROBRN --qty 4 --price 95.00
-//                                             # save as multi SKU order (no GL posting)
+//  Usage — sales orders (Doesn't post to GL)
+//    dotnet run -- --method order --evolutionenv evocopy --customer ARA001 --item 0211CRBL --qty 5 --price 100.00 --rep 002 --warehouse 004
+//                                             # save as order against copy Evolution DB (no GL posting)
+//    dotnet run -- --method order --evolutionenv evolive --customer ARA001 --item 0211CRBL --qty 5 --price 100.00 --rep 002 --warehouse 004
+//                                             # save as order against live Evolution DB (no GL posting)
+//    dotnet run -- --method order --evolutionenv evocopy --customer ARA001 --warehouse 004 --rep 002 --item 0211CRBL --qty 5 --price 100.00 --item 0212CRBL --qty 3 --price 85.00 --item 0251CBLK --qty 2 --price 150.00 --item 0271CBLK --qty 1 --price 200.00 --item 1003BROBRN --qty 4 --price 95.00
+//                                             # save as multi-SKU order (no GL posting)
 
 
 
@@ -200,6 +202,13 @@ namespace JekyllAndHide.Evolution
                 { Console.Error.WriteLine("--customer CODE is required for --method order."); return 1; }
                 if (orderLines.Count == 0)
                 { Console.Error.WriteLine("At least one --item CODE is required for --method order."); return 1; }
+                if (string.IsNullOrWhiteSpace(evolutionEnvArg) ||
+                    (!evolutionEnvArg.Equals("evocopy", StringComparison.OrdinalIgnoreCase) &&
+                     !evolutionEnvArg.Equals("evolive", StringComparison.OrdinalIgnoreCase)))
+                {
+                    Console.Error.WriteLine("--evolutionenv evocopy|evolive is required for --method order.");
+                    return 1;
+                }
             }
 
             if (method == "updatesnapshottables")
@@ -239,6 +248,8 @@ namespace JekyllAndHide.Evolution
             Console.WriteLine($"  Serial     : {SerialNumber}");
             if (method == "order")
             {
+                bool evoLiveOrder = evolutionEnvArg.Equals("evolive", StringComparison.OrdinalIgnoreCase);
+                Console.WriteLine($"  Evo DB     : {(evoLiveOrder ? CompanyDbLive + " (evolive)" : CompanyDb + " (evocopy)")}");
                 Console.WriteLine($"  Customer   : {customerCode}");
                 Console.WriteLine($"  Warehouse  : {orderWarehouse}");
                 Console.WriteLine($"  Lines      : {orderLines.Count}");
@@ -292,7 +303,9 @@ namespace JekyllAndHide.Evolution
 
                 sw.Restart();
                 Console.Write($"Connecting to company DB... ");
-                DatabaseContext.CreateConnection(SqlServer, CompanyDb, DbUser, DbPassword, false);
+                string activeEvoDb = evolutionEnvArg.Equals("evolive", StringComparison.OrdinalIgnoreCase)
+                    ? CompanyDbLive : CompanyDb;
+                DatabaseContext.CreateConnection(SqlServer, activeEvoDb, DbUser, DbPassword, false);
                 Console.WriteLine($"OK  ({sw.ElapsedMilliseconds} ms)\n");
 
                 // ---- sales order (exits before warehouse lookup) -----------
