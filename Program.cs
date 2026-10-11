@@ -19,11 +19,11 @@
 //    dotnet run -- --method sdk --warehouse 005 --debug  # show DataTable schema
 //
 //  Usage — sales orders (Doesn't post to GL)
-//    dotnet run -- --method order --evolutionenv evocopy --customer ARA001 --item 0211CRBL --qty 5 --price 100.00 --rep 002 --warehouse 004
+//    dotnet run -- --method order --evolutionenv evocopy --customer ARA001 --item 0211CRBL --qty 5 --price 100.00 --rep 002 --warehouse 004  --ordernumber WEB-00123 --description "Online order 2026-08-16"
 //                                             # save as order against copy Evolution DB (no GL posting)
-//    dotnet run -- --method order --evolutionenv evolive --customer ARA001 --item 0211CRBL --qty 5 --price 100.00 --rep 002 --warehouse 004
+//    dotnet run -- --method order --evolutionenv evolive --customer ARA001 --item 0211CRBL --qty 5 --price 100.00 --rep 002 --warehouse 004 --ordernumber WEB-00123 --description "Online order 2026-08-16" --message1 "Please deliver to back entrance" --addr1 "Attn: John Smith" --addr2 "15 Buitenkant Street" --addr3 "Gardens" --addr4 "Cape Town" --postcode "8001"
 //                                             # save as order against live Evolution DB (no GL posting)
-//    dotnet run -- --method order --evolutionenv evocopy --customer ARA001 --warehouse 004 --rep 002 --item 0211CRBL --qty 5 --price 100.00 --item 0212CRBL --qty 3 --price 85.00 --item 0251CBLK --qty 2 --price 150.00 --item 0271CBLK --qty 1 --price 200.00 --item 1003BROBRN --qty 4 --price 95.00
+//    dotnet run -- --method order --evolutionenv evocopy --customer ARA001 --warehouse 004 --rep 002 --item 0211CRBL --qty 5 --price 100.00 --item 0212CRBL --qty 3 --price 85.00 --item 0251CBLK --qty 2 --price 150.00 --item 0271CBLK --qty 1 --price 200.00 --item 1003BROBRN --qty 4 --price 95.00 --ordernumber WEB-00123 --description "Online order 2026-08-16" --message1 "Please deliver to back entrance" --addr1 "Attn: John Smith" --addr2 "15 Buitenkant Street" --addr3 "Gardens" --addr4 "Cape Town" --postcode "8001"
 //                                             # save as multi-SKU order (no GL posting)
 
 
@@ -179,6 +179,14 @@ namespace JekyllAndHide.Evolution
             List<string> qtyStrs    = PopAllArgs(argsList, "--qty");
             List<string> priceStrs  = PopAllArgs(argsList, "--price");
             string repCode        = PopArg(argsList, "--rep");
+            string orderNumber    = PopArg(argsList, "--ordernumber");
+            string orderDesc      = PopArg(argsList, "--description");
+            string message1       = PopArg(argsList, "--message1");
+            string addrLine1      = PopArg(argsList, "--addr1");
+            string addrLine2      = PopArg(argsList, "--addr2");
+            string addrLine3      = PopArg(argsList, "--addr3");
+            string addrLine4      = PopArg(argsList, "--addr4");
+            string addrPostcode   = PopArg(argsList, "--postcode");
             string envArg         = PopArg(argsList, "--hostkingenv");
             string evolutionEnvArg = PopArg(argsList, "--evolutionenv");
             string orderWarehouse = string.IsNullOrWhiteSpace(warehouseArg) ? DefaultOrderWarehouse : warehouseArg;
@@ -186,14 +194,14 @@ namespace JekyllAndHide.Evolution
             bool   allWarehouses  = invWarehouse.Equals("all", StringComparison.OrdinalIgnoreCase);
             bool   processNow     = argsList.RemoveAll(a => a.Equals("--process", StringComparison.OrdinalIgnoreCase)) > 0;
 
-            var orderLines = new List<(string ItemCode, double Qty, double Price)>();
+            var orderLines = new List<(string ItemCode, double Qty, double Price, string WarehouseCode)>();
             for (int li = 0; li < itemCodes.Count; li++)
             {
                 double qty   = 1.0;
                 double price = 0.0;
                 if (li < qtyStrs.Count)   double.TryParse(qtyStrs[li],   System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out qty);
                 if (li < priceStrs.Count) double.TryParse(priceStrs[li], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out price);
-                orderLines.Add((itemCodes[li], qty, price));
+                orderLines.Add((itemCodes[li], qty, price, orderWarehouse));
             }
 
             if (method == "order")
@@ -308,10 +316,18 @@ namespace JekyllAndHide.Evolution
                 DatabaseContext.CreateConnection(SqlServer, activeEvoDb, DbUser, DbPassword, false);
                 Console.WriteLine($"OK  ({sw.ElapsedMilliseconds} ms)\n");
 
+                // ---- SDK inspection (no order placed) --------------------
+                if (method == "order" && args.Any(a => a.Equals("--inspect", StringComparison.OrdinalIgnoreCase)))
+                {
+                    InspectSalesOrder();
+                    return 0;
+                }
+
                 // ---- sales order (exits before warehouse lookup) -----------
                 if (method == "order")
                 {
-                    string reference = CreateSalesOrder(customerCode, orderLines, orderWarehouse, processNow, repCode);
+                    string reference = CreateSalesOrder(customerCode, orderLines, orderWarehouse, processNow, repCode, orderNumber, orderDesc,
+                        message1, addrLine1, addrLine2, addrLine3, addrLine4, addrPostcode);
                     Console.WriteLine($"\nDone.  Reference: {reference}");
                     Console.WriteLine($"Total time: {totalTimer.Elapsed.TotalSeconds:F2}s");
                     return 0;
@@ -424,10 +440,18 @@ namespace JekyllAndHide.Evolution
 
         private static string CreateSalesOrder(
             string customerCode,
-            List<(string ItemCode, double Qty, double Price)> lines,
+            List<(string ItemCode, double Qty, double Price, string WarehouseCode)> lines,
             string warehouseCode,
             bool   processNow,
-            string repCode = "")
+            string repCode      = "",
+            string orderNumber  = "",
+            string description  = "",
+            string message1     = "",
+            string addrLine1    = "",
+            string addrLine2    = "",
+            string addrLine3    = "",
+            string addrLine4    = "",
+            string addrPostcode = "")
         {
             Console.WriteLine($"Building order — customer: {customerCode}  warehouse: {warehouseCode}  lines: {lines.Count}");
 
@@ -437,6 +461,35 @@ namespace JekyllAndHide.Evolution
                 InvoiceDate = DateTime.Now
             };
 
+            if (!string.IsNullOrWhiteSpace(orderNumber))
+            {
+                SO.ExternalOrderNo = orderNumber;
+                Console.WriteLine($"  External Order No : {orderNumber}");
+            }
+            if (!string.IsNullOrWhiteSpace(description))
+            {
+                SO.Description = description;
+                Console.WriteLine($"  Description       : {description}");
+            }
+            if (!string.IsNullOrWhiteSpace(message1))
+            {
+                SO.MessageLine1 = message1;
+                Console.WriteLine($"  Message Line 1    : {message1}");
+            }
+
+            bool hasAddr = !string.IsNullOrWhiteSpace(addrLine1) || !string.IsNullOrWhiteSpace(addrLine2) ||
+                           !string.IsNullOrWhiteSpace(addrLine3) || !string.IsNullOrWhiteSpace(addrLine4) ||
+                           !string.IsNullOrWhiteSpace(addrPostcode);
+            if (hasAddr)
+            {
+                if (!string.IsNullOrWhiteSpace(addrLine1))    SO.DeliverTo.Line1      = addrLine1;
+                if (!string.IsNullOrWhiteSpace(addrLine2))    SO.DeliverTo.Line2      = addrLine2;
+                if (!string.IsNullOrWhiteSpace(addrLine3))    SO.DeliverTo.Line3      = addrLine3;
+                if (!string.IsNullOrWhiteSpace(addrLine4))    SO.DeliverTo.Line4      = addrLine4;
+                if (!string.IsNullOrWhiteSpace(addrPostcode)) SO.DeliverTo.PostalCode = addrPostcode;
+                Console.WriteLine($"  Deliver To        : {addrLine1}, {addrLine2}, {addrLine3}, {addrLine4}  {addrPostcode}");
+            }
+
             if (!string.IsNullOrWhiteSpace(repCode))
             {
                 Console.Write($"  Setting sales rep '{repCode}'... ");
@@ -444,13 +497,16 @@ namespace JekyllAndHide.Evolution
                 Console.WriteLine("OK");
             }
 
+            SetIsLoading(SO, true);
             foreach (var line in lines)
             {
-                Console.Write($"  Adding line {line.ItemCode} qty={line.Qty} price={line.Price:F2}... ");
-                OrderDetail od = SO.Detail.Add(line.ItemCode, line.Qty, line.Price);
+                Console.Write($"  Adding line {line.ItemCode} qty={line.Qty} price={line.Price:F2} warehouse={line.WarehouseCode}... ");
+                var sw2 = Stopwatch.StartNew();
+                OrderDetail od = SO.Detail.Add(line.ItemCode, line.WarehouseCode, line.Qty, line.Price);
                 od.TaxType = new TaxRate(1);
-                Console.WriteLine("OK");
+                Console.WriteLine($"OK  ({sw2.ElapsedMilliseconds} ms)");
             }
+            SetIsLoading(SO, false);
 
             if (processNow)
             {
@@ -1103,7 +1159,63 @@ END";
         //  HELPERS
         // ================================================================
 
-        private static List<Warehouse> LoadAllWarehouses()
+        private static void InspectSalesOrder()
+        {
+            Console.WriteLine("=== SalesOrder public properties (all levels) ===\n");
+            var so = new SalesOrder();
+            var seen = new System.Collections.Generic.HashSet<string>();
+            Type t = typeof(SalesOrder);
+            while (t != null && t != typeof(object))
+            {
+                Console.WriteLine($"--- {t.FullName} ---");
+                foreach (var p in t.GetProperties(System.Reflection.BindingFlags.Public |
+                                                   System.Reflection.BindingFlags.Instance |
+                                                   System.Reflection.BindingFlags.DeclaredOnly)
+                                   .OrderBy(p => p.Name))
+                {
+                    if (!seen.Add(p.Name)) continue;
+                    string val = "";
+                    try { val = p.GetValue(so)?.ToString() ?? "<null>"; } catch { val = "<error>"; }
+                    Console.WriteLine($"  {p.PropertyType.Name,-30} {p.Name,-35} = {val}");
+                }
+                t = t.BaseType;
+            }
+
+            Console.WriteLine("\n=== Address properties (DeliverTo / InvoiceTo type) ===\n");
+            var addr = so.DeliverTo;
+            foreach (var p in typeof(Address).GetProperties(System.Reflection.BindingFlags.Public |
+                                                             System.Reflection.BindingFlags.Instance)
+                                              .OrderBy(p => p.Name))
+            {
+                string val2 = "";
+                try { val2 = p.GetValue(addr)?.ToString() ?? "<null>"; } catch { val2 = "<error>"; }
+                Console.WriteLine($"  {p.PropertyType.Name,-20} {p.Name,-30} = {val2}");
+            }
+
+            Console.WriteLine("\n=== SalesOrder non-public properties ===\n");
+            t = typeof(SalesOrder);
+            while (t != null && t != typeof(object))
+            {
+                foreach (var p in t.GetProperties(System.Reflection.BindingFlags.NonPublic |
+                                                   System.Reflection.BindingFlags.Instance |
+                                                   System.Reflection.BindingFlags.DeclaredOnly)
+                                   .OrderBy(p => p.Name))
+                {
+                    if (!seen.Add(p.Name)) continue;
+                    Console.WriteLine($"  [{t.Name}] {p.PropertyType.Name,-25} {p.Name}");
+                }
+                t = t.BaseType;
+            }
+        }
+
+        private static void SetIsLoading(SalesOrder so, bool value)
+        {
+            var prop   = typeof(SalesOrder).BaseType.GetProperty("IsLoading");
+            var setter = prop.GetSetMethod(nonPublic: true);
+            setter.Invoke(so, new object[] { value });
+        }
+
+private static List<Warehouse> LoadAllWarehouses()
         {
             DataTable dt = Warehouse.List("");
             var result = new List<Warehouse>();
